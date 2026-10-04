@@ -25,6 +25,7 @@ from urllib.parse import urlparse, parse_qs
 import collector
 import integrity
 import iocs
+import paths
 import whitelist
 import rules
 import winapi
@@ -32,12 +33,16 @@ import winapi
 # 兼容 PyInstaller 单文件打包后的资源路径
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "app")
-    WORKSPACE = os.path.dirname(os.path.abspath(sys.executable))
+    PROGRAM_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
-    WORKSPACE = os.path.dirname(APP_DIR)
+    PROGRAM_DIR = paths.PROGRAM_DIR
+
+# WORKSPACE = 运行期数据目录（用户可写），**不是**程序目录。
+# 分离原因见 paths.py：程序目录会被收紧为仅管理员可写，运行期数据必须另放。
+WORKSPACE = paths.DATA_DIR
 WEB_DIR = os.path.join(APP_DIR, "web")
-REPORT_DIR = os.path.join(WORKSPACE, "reports")
+REPORT_DIR = paths.REPORT_DIR
 
 # ---------------------------------------------------------------- 接口防护
 # ⚠️ 安全：本地 HTTP 服务必须防跨站请求伪造（CSRF）。
@@ -155,28 +160,73 @@ class Monitor:
                 self._spawn_once("integrity", self.check_integrity)
             time.sleep(max(0.2, self.proc_interval - (time.time() - t0)))
 
-    def _refresh_integrity_baseline(self):
-        """用户通过界面合法修改已知项后，同步刷新完整性基线。
+    def _refresh_integrity_baseline(self) -> list[str] | None:
+        """界面合法增删已知项后刷新基线 —— **只接受 whitelist.json 的差异**。
 
-        whitelist.json 放在 app/ 下，会被完整性自检覆盖 —— 这是有意为之：
-        如果有人绕过界面直接改它来掩盖告警，完整性告警会立刻触发。
-        因此界面上的合法增删需要同步基线，否则会误报。
+        ⚠️ 这里曾经是全量重建（把 app/ 下所有文件的哈希重算一遍整体覆盖），
+        那是个严重的漏洞：攻击者改掉 rules.py（删检测规则）后，
+        用户只要对**任何一条无关告警**点一次"加入已知项"，
+        篡改就被写进新基线、告警消失 —— 触发动作完全日常，用户毫不知情。
+
+        现在的语义：除 whitelist.json 之外的任何差异（改动 / 新增 / 缺失）
+        都**拒绝刷新**，保留完整性告警，并把差异清单返回给调用方展示。
+        全量重建只保留给界面上那个显式按钮（用户明确知道自己在做什么）。
+
+        返回 None 表示刷新成功；返回非空列表表示被拒绝，内容是差异文件。
         """
         try:
-            extra = [sys.executable] if getattr(sys, "frozen", False) else []
-            m = integrity.collect_manifest(APP_DIR, extra)
-            integrity.save_baseline(WORKSPACE, m, note="界面修改已知项后自动刷新")
+            cur = integrity.collect_manifest(APP_DIR, self._integrity_extras())
+            base = integrity.load_baseline(WORKSPACE)
+            if not base:
+                # 没有基线（首次运行）→ 正常建立
+                integrity.save_baseline(WORKSPACE, cur, app_dir=APP_DIR,
+                                            note="界面修改已知项后自动刷新")
+                self._integrity_alerted = False
+                self.check_integrity()
+                return None
+
+            old = base.get("files", {}) or {}
+            removed = sorted(k for k in old if k not in cur)
+            if removed:
+                return ["（缺失）" + r for r in removed]
+            changed = sorted(k for k in cur if k in old and cur[k] != old[k])
+            added = sorted(k for k in cur if k not in old)
+            unexpected = [k for k in changed + added if k != "whitelist.json"]
+            if unexpected:
+                return unexpected
+
+            integrity.save_baseline(WORKSPACE, cur, app_dir=APP_DIR,
+                                            note="界面修改已知项后自动刷新")
             self._integrity_alerted = False
-            # 立即重新校验：否则界面上的完整性状态会停留在"文件已被改动"，
-            # 直到下一次 5 分钟定时校验才更新（用户会以为程序真的被篡改了）。
             self.check_integrity()
+            return None
         except Exception:
-            pass
+            return ["（内部错误）基线刷新失败"]
+
+    @staticmethod
+    def _integrity_extras() -> list[str]:
+        """完整性校验要覆盖的「app/ 之外」的文件。
+
+        为什么必须包含 python_path.txt：启动器会执行它里面写的解释器路径，
+        而它原先不在基线覆盖范围内 —— 能写项目根目录的人改掉它，
+        用户下次双击启动器就执行了攻击者的程序（且监视器根本不会启动，
+        自检告警永远不出现）。把它纳入基线后，改动会触发「程序文件已被改动」。
+        """
+        extra: list[str] = []
+        if getattr(sys, "frozen", False):
+            extra.append(sys.executable)
+        # 启动器会执行 python_path.txt 里写的解释器 —— 必须纳入基线，
+        # 否则改掉它就能让启动器执行攻击者的程序，且监视器根本不会启动。
+        if os.path.isfile(paths.PYTHON_PATH_FILE):
+            extra.append(paths.PYTHON_PATH_FILE)
+        # whitelist.json 移到了数据目录，不再被 app/ 遍历覆盖，需显式加入
+        if os.path.isfile(whitelist.WHITELIST_FILE):
+            extra.append(whitelist.WHITELIST_FILE)
+        return extra
 
     def check_integrity(self):
         """校验程序自身文件是否被改动。结果会出现在界面的「安全状态」里。"""
-        extra = [sys.executable] if getattr(sys, "frozen", False) else []
-        res = integrity.verify(APP_DIR, WORKSPACE, extra)
+        res = integrity.verify(APP_DIR, WORKSPACE, self._integrity_extras())
         with self.lock:
             self.integrity = res
             self.last_integrity = time.time()
@@ -210,8 +260,9 @@ class Monitor:
         """用户确认改动是自己做的 → 重建基线。"""
         extra = [sys.executable] if getattr(sys, "frozen", False) else []
         m = integrity.collect_manifest(APP_DIR, extra)
-        integrity.save_baseline(WORKSPACE, m, note="用户从界面确认并重建")
-        integrity.save_sentinel(WORKSPACE, m)
+        integrity.save_baseline(WORKSPACE, m, app_dir=APP_DIR,
+                                        note="用户从界面确认并重建")
+        integrity.save_sentinel(WORKSPACE, m, APP_DIR)
         self._integrity_alerted = False
         self.check_integrity()
         return True
@@ -636,8 +687,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _guard(self) -> bool:
         """POST 请求的四层来源校验。任一层不过直接 403。"""
-        if not hmac.compare_digest(self.headers.get("X-Yinhu-Token") or "",
-                                   SESSION_TOKEN):
+        # compare_digest 对含非 ASCII 的字符串抛 TypeError。
+        # 失败关闭没问题，但语义应是 403（令牌不对）而不是 500（服务端出错）。
+        try:
+            token_ok = hmac.compare_digest(self.headers.get("X-Yinhu-Token") or "",
+                                           SESSION_TOKEN)
+        except TypeError:
+            token_ok = False
+        if not token_ok:
             self._json({"ok": False, "msg": "拒绝：访问令牌缺失或不正确"}, 403)
             return False
         origin = self.headers.get("Origin")
@@ -766,18 +823,49 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json({"ok": True, "suggest": whitelist.suggest(subj, fnd)})
         elif p == "/api/whitelist/add":
+            rid = str(body.get("rule_id") or "")
             m2 = body.get("match") or {}
-            e = whitelist.add(str(body.get("rule_id") or ""),
-                              str(m2.get("type") or "rule_only"),
-                              str(m2.get("value") or ""),
+            mtype = str(m2.get("type") or "rule_only")
+            mvalue = str(m2.get("value") or "")
+
+            # 入参校验：否则可以构造"全量豁免"条目 ——
+            # 例如 exe_path_prefix + 空 value（"任意路径".startswith("") 恒真）
+            # 会让某条规则对所有进程永久失效。
+            known_rules = {r[0] for r in _RULE_DOC}
+            if rid not in known_rules:
+                self._json({"ok": False, "msg": f"未知规则号：{rid or '(空)'}"}, 400)
+                return
+            if mtype not in whitelist.MATCH_TYPES:
+                self._json({"ok": False,
+                            "msg": f"不支持的匹配方式：{mtype}"}, 400)
+                return
+            if mtype != "rule_only" and not mvalue.strip():
+                self._json({"ok": False,
+                            "msg": "匹配条件不能为空——空值会让该规则对所有对象失效"}, 400)
+                return
+
+            e = whitelist.add(rid, mtype, mvalue,
                               str((body.get("guard") or {}).get("file") or ""),
                               str(body.get("note") or ""))
-            m._refresh_integrity_baseline()
-            self._json({"ok": True, "entry": e, "msg": "已加入已知项，该告警不再显示"})
+            blocked = m._refresh_integrity_baseline()
+            if blocked:
+                self._json({"ok": True, "entry": e, "integrity_refresh": "blocked",
+                            "changed_files": blocked,
+                            "msg": "已加入已知项；但完整性基线刷新被拒绝——"
+                                   "检测到其它程序文件与基线不一致，请先在「安全状态」中处理"})
+            else:
+                self._json({"ok": True, "entry": e,
+                            "msg": "已加入已知项，该告警不再显示"})
         elif p == "/api/whitelist/remove":
             ok = whitelist.remove(str(body.get("id") or ""))
-            m._refresh_integrity_baseline()
-            self._json({"ok": ok, "msg": "已移除" if ok else "未找到该条目"})
+            blocked = m._refresh_integrity_baseline()
+            if blocked:
+                self._json({"ok": ok, "integrity_refresh": "blocked",
+                            "changed_files": blocked,
+                            "msg": "已移除；但完整性基线刷新被拒绝——"
+                                   "检测到其它程序文件与基线不一致，请先在「安全状态」中处理"})
+            else:
+                self._json({"ok": ok, "msg": "已移除" if ok else "未找到该条目"})
         elif p == "/api/shutdown":
             self._json({"ok": True, "msg": "监视器正在退出"})
             # 加固：延迟 0.3s 再关停，保证响应送达（初版立即 shutdown，

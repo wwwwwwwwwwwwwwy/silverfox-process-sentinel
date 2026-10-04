@@ -445,11 +445,6 @@ def get_scheduled_tasks() -> list[dict]:
 
 def get_drivers() -> list[dict]:
     script = (
-        "Get-CimInstance -ClassName Win32_SystemDriver | "
-        "Select-Object Name,DisplayName,PathName,State,StartMode | "
-        "ConvertTo-Json -InputObject @($input) -Compress -Depth 4"
-    )
-    script = (
         "$d=Get-CimInstance -ClassName Win32_SystemDriver | ForEach-Object {"
         "[pscustomobject]@{name=[string]$_.Name;display=[string]$_.DisplayName;"
         "path=[string]$_.PathName;state=[string]$_.State;start=[string]$_.StartMode}};"

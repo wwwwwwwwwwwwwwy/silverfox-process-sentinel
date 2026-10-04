@@ -248,11 +248,11 @@ def _task_writable_hit(p: str) -> str:
     """
     if not p:
         return ""
-    # 先按"目录语义"排除系统只读目录：Program Files 下默认只有管理员/SYSTEM
+    # 先按「目录语义」排除系统只读目录：Program Files 下默认只有管理员/SYSTEM
     # 可写，子目录叫什么名字都一样 —— 普通用户放不进文件，
     # "脚本可被替换"这个前提就不成立。
     #
-    # ⚠️ 不能改用 nonstandard_target 的"子目录名是否随机"来判断：
+    # 注意：不能改用 nonstandard_target 的"子目录名是否随机"来判断 ——
     # looks_random 会把合法的驼峰命名（MyWatchdog / SysMon / Python313）
     # 判成随机名，从而把正常软件的 Program Files 目录误判为"用户可写"（实测踩过）。
     if in_dirs(p, [r"\Program Files", r"\Program Files (x86)", r"\Windows\System32",

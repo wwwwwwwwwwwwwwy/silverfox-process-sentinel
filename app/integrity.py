@@ -68,11 +68,15 @@ def load_sentinel() -> dict | None:
     return None
 
 
-def save_sentinel(workspace: str, manifest: dict) -> None:
+def save_sentinel(workspace: str, manifest: dict, app_dir: str | None = None) -> None:
     try:
         os.makedirs(SENTINEL_DIR, exist_ok=True)
         d = {"created": time.strftime("%Y-%m-%d %H:%M:%S"),
-             "workspace": os.path.abspath(workspace), "count": len(manifest)}
+             "workspace": os.path.abspath(workspace),
+             # 同时记 app_dir：数据目录是每用户的，同机多份副本共用它。
+             # 只比 workspace 的话，另一份副本会被判成"基线被人删除"。
+             "app_dir": os.path.abspath(app_dir) if app_dir else "",
+             "count": len(manifest)}
         with open(sentinel_path(), "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=1)
     except Exception:
@@ -125,10 +129,14 @@ def load_baseline(workspace: str) -> dict | None:
     return None
 
 
-def save_baseline(workspace: str, manifest: dict, note: str = "") -> dict:
+def save_baseline(workspace: str, manifest: dict, note: str = "",
+                  app_dir: str | None = None) -> dict:
     d = {
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "note": note or "程序首次运行或用户手动重建",
+        # 记下这份基线是给哪个程序目录算的：数据目录是「每用户」的，
+        # 同机多份副本会共用它，没有这个字段就会互相误报"文件已被改动"。
+        "app_dir": os.path.abspath(app_dir) if app_dir else "",
         "files": manifest,
     }
     with open(baseline_path(workspace), "w", encoding="utf-8") as f:
@@ -147,11 +155,20 @@ def verify(app_dir: str, workspace: str, extra_files: list[str] | None = None) -
     """
     cur = collect_manifest(app_dir, extra_files)
     base = load_baseline(workspace)
+    # 基线属于另一个程序目录（同机多份副本共用数据目录）→ 按首次运行处理，
+    # 否则另一份副本会看到满屏"文件已被改动"的假告警。
+    if base and base.get("app_dir") and \
+            os.path.normcase(base["app_dir"]) != os.path.normcase(os.path.abspath(app_dir)):
+        base = None
     if not base:
         sent = load_sentinel()
         # 哨兵只对"同一安装位置"有效：文件夹整体被拷贝到新位置时
         # 视为全新安装，正常建立基线，而不是误报基线丢失。
-        if sent and sent.get("workspace") == os.path.abspath(workspace):
+        sent_here = bool(sent) and sent.get("workspace") == os.path.abspath(workspace)
+        if sent_here and sent.get("app_dir") and \
+                os.path.normcase(sent["app_dir"]) != os.path.normcase(os.path.abspath(app_dir)):
+            sent_here = False      # 哨兵属于另一个程序目录（同机多份副本）
+        if sent_here:
             # 加固：基线没了但哨兵还在 → 基线被人删除或损坏，告警而不是重建
             return {
                 "status": "baseline_lost",
@@ -161,8 +178,8 @@ def verify(app_dir: str, workspace: str, extra_files: list[str] | None = None) -
                 "baseline_time": sent.get("created", "未知"),
                 "ts": time.time(),
             }
-        save_baseline(workspace, cur)
-        save_sentinel(workspace, cur)
+        save_baseline(workspace, cur, app_dir=app_dir)
+        save_sentinel(workspace, cur, app_dir)
         return {
             "status": "first_run",
             "status_zh": "首次运行，已建立完整性基线",
@@ -200,13 +217,20 @@ def main():
     except Exception:
         pass
     here = os.path.dirname(os.path.abspath(__file__))
-    workspace = os.path.dirname(here)
+    # 数据目录（用户可写）与程序目录已分离：基线在数据目录，
+    # 不能再按"程序目录的上一级"去猜。
+    import paths
+    workspace = paths.DATA_DIR
     extra = [sys.executable] if getattr(sys, "frozen", False) else []
+    for p in (paths.PYTHON_PATH_FILE, paths.WHITELIST_FILE):
+        if os.path.isfile(p):
+            extra.append(p)
     if "--accept" in sys.argv:
         m = collect_manifest(here, extra)
-        save_baseline(workspace, m, note="用户通过命令行重建基线")
-        save_sentinel(workspace, m)
+        save_baseline(workspace, m, app_dir=here, note="用户通过命令行重建基线")
+        save_sentinel(workspace, m, here)
         print(f"已重建完整性基线，共 {len(m)} 个文件。")
+        print(f"数据目录：{workspace}")
         return
     r = verify(here, workspace, extra)
     print(f"状态：{r['status_zh']}")

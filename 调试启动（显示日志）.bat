@@ -2,17 +2,16 @@
 chcp 936 >nul
 title 银狐进程监视器 - 调试模式（显示日志）
 cd /d "%~dp0"
-setlocal enabledelayedexpansion
 
+set "CFGPY="
+if exist "%~dp0python_path.txt" set /p CFGPY=<"%~dp0python_path.txt"
+
+setlocal enabledelayedexpansion
 set "PYEXE="
 
-if exist "%~dp0python_path.txt" (
-  set "CFGPY="
-  set /p CFGPY=<"%~dp0python_path.txt"
-  if defined CFGPY if exist "!CFGPY!" (
-    "!CFGPY!" -c "import psutil" >nul 2>nul
-    if not errorlevel 1 set "PYEXE=!CFGPY!"
-  )
+if defined CFGPY if exist "!CFGPY!" (
+  "!CFGPY!" -c "import psutil" >nul 2>nul
+  if not errorlevel 1 set "PYEXE=!CFGPY!"
 )
 
 if not defined PYEXE if exist "%~dp0runtime\python.exe" (

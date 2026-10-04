@@ -2,7 +2,6 @@
 chcp 936 >nul
 title 银狐进程监视器
 cd /d "%~dp0"
-setlocal enabledelayedexpansion
 
 rem ============================================================
 rem  启动银狐进程监视器
@@ -25,17 +24,19 @@ if not exist "%~dp0app\main.py" (
   exit /b 1
 )
 
+rem 注意：必须在这里读（setlocal enabledelayedexpansion 之前）：
+rem 延迟展开会把路径里的感叹号当成变量引用吞掉。
+set "CFGPY="
+if exist "%~dp0python_path.txt" set /p CFGPY=<"%~dp0python_path.txt"
+
+setlocal enabledelayedexpansion
 set "PYEXE="
 
 rem 候选 1：python_path.txt 显式指定
-if exist "%~dp0python_path.txt" (
-  set "CFGPY="
-  set /p CFGPY=<"%~dp0python_path.txt"
-  if defined CFGPY (
-    if exist "!CFGPY!" (
-      "!CFGPY!" -c "import psutil" >nul 2>nul
-      if not errorlevel 1 set "PYEXE=!CFGPY!"
-    )
+if defined CFGPY (
+  if exist "!CFGPY!" (
+    "!CFGPY!" -c "import psutil" >nul 2>nul
+    if not errorlevel 1 set "PYEXE=!CFGPY!"
   )
 )
 
@@ -91,5 +92,7 @@ if not defined PYEXE (
   exit /b 1
 )
 
+rem 把实际使用的解释器路径显示出来 —— 如果被换成了陌生的路径，一眼就能看见
+echo  使用解释器: !PYEXE!
 start "" "!PYEXE!" "%~dp0app\main.py"
 exit /b 0

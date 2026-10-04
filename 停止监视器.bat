@@ -3,15 +3,21 @@ chcp 936 >nul
 title 停止银狐进程监视器
 cd /d "%~dp0"
 
+rem 运行期数据在数据目录（%LOCALAPPDATA%\SilverFoxSentinel），不在程序目录。
+rem 程序目录会被收紧为仅管理员可写，所以端口/令牌只能放在用户可写的位置。
+set "DATA=%LOCALAPPDATA%\SilverFoxSentinel"
+if not exist "%DATA%\runtime_port.txt" if exist "%~dp0runtime_port.txt" set "DATA=%~dp0"
+
 setlocal enabledelayedexpansion
 set "PORT="
 set "TOKEN="
-if exist "%~dp0runtime_port.txt" set /p PORT=<"%~dp0runtime_port.txt"
-if exist "%~dp0runtime_token.txt" set /p TOKEN=<"%~dp0runtime_token.txt"
+if exist "%DATA%\runtime_port.txt" set /p PORT=<"%DATA%\runtime_port.txt"
+if exist "%DATA%\runtime_token.txt" set /p TOKEN=<"%DATA%\runtime_token.txt"
 
 if not defined TOKEN (
   echo.
   echo  [提示] 未找到会话令牌文件（runtime_token.txt），监视器可能未在运行。
+  echo  查找位置：%DATA%
   echo  若界面窗口仍开着，直接关闭窗口即可。
   echo.
   timeout /t 3 >nul

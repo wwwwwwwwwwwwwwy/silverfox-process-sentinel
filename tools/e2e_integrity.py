@@ -20,11 +20,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _common  # noqa: E402
 
 _common.ensure_import_path()
+import paths  # noqa: E402
 
 C = _common.Checker()
 APP = _common.app_dir()
 ROOT = _common.repo_root()
-WL = os.path.join(APP, "whitelist.json")
+# 运行期数据在数据目录（%LOCALAPPDATA%\SilverFoxSentinel），不在程序目录 ——
+# 程序目录被设计为可收紧成只读，所以端口/令牌/基线/已知项都放在用户可写的数据目录。
+WL = paths.WHITELIST_FILE
 
 
 def integrity_status():

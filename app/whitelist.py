@@ -33,8 +33,11 @@ import os
 import re
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-WHITELIST_FILE = os.path.join(HERE, "whitelist.json")
+import paths
+
+# 放在**数据目录**而不是 app/ 下：程序目录要收紧为只读，写不进去。
+# 它仍然受完整性自检保护 —— 通过 server._integrity_extras() 纳入基线。
+WHITELIST_FILE = paths.WHITELIST_FILE
 
 # 从命令行里能识别出的"可执行文件"扩展名 —— 用于自动挑守卫文件
 GUARD_EXTS = (".ps1", ".bat", ".cmd", ".vbs", ".js", ".exe", ".dll", ".py")
