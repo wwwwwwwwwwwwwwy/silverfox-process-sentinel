@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="yinhu-token" content="__YINHU_TOKEN__">
+<title>银狐进程监视器 · SilverFox Sentinel</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">
+      <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+        <path d="M16 2 4 7v9c0 7.2 5.1 12.6 12 14 6.9-1.4 12-6.8 12-14V7L16 2z"
+              fill="none" stroke="#3b82f6" stroke-width="1.6"/>
+        <path d="M16 9.5 9.5 12v5c0 3.6 2.8 6.6 6.5 7.4 3.7-.8 6.5-3.8 6.5-7.4v-5L16 9.5z"
+              fill="none" stroke="#60a5fa" stroke-width="1.1" opacity=".75"/>
+        <circle cx="16" cy="16" r="2.2" fill="#ff5c5c"/>
+      </svg>
+    </div>
+    <div class="brand-text">
+      <h1>银狐进程监视器</h1>
+      <span class="sub">SILVERFOX&nbsp;PROCESS&nbsp;SENTINEL</span>
+    </div>
+  </div>
+
+  <div class="topbar-right">
+    <div class="pill" id="pillStatus"><i class="dot"></i><span>初始化</span></div>
+    <div class="pill" id="pillAdmin"><i class="dot"></i><span>权限检测中</span></div>
+    <div class="pill" id="pillUptime"><span>运行 00:00</span></div>
+    <button class="btn" id="btnScan">立即重扫</button>
+    <button class="btn primary" id="btnExport">导出报告</button>
+  </div>
+</header>
+
+<main>
+  <section class="kpis" id="kpis"></section>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="proc">进程监控 <em id="tabProcCount"></em></button>
+    <button class="tab" data-tab="art">系统制品 <em id="tabArtCount"></em></button>
+    <button class="tab" data-tab="alert">告警时间线 <em id="tabAlertCount"></em></button>
+    <button class="tab" data-tab="rules">规则与 IOC</button>
+  </nav>
+
+  <!-- ===================== 进程监控 ===================== -->
+  <section class="panel tabpane active" id="pane-proc">
+    <div class="toolbar">
+      <input type="search" id="q" placeholder="搜索进程名 / 路径 / PID / 命令行…" autocomplete="off">
+      <div class="seg" id="segLevel">
+        <button data-lv="all" class="on">全部</button>
+        <button data-lv="risky">仅异常</button>
+        <button data-lv="critical">严重</button>
+        <button data-lv="high">高危</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="chkConn"> 仅看有外联</label>
+      <span class="toolbar-info" id="procInfo"></span>
+    </div>
+
+    <div class="tablewrap">
+      <table class="grid" id="procTable">
+        <thead>
+          <tr>
+            <th class="c-risk" data-sort="score">风险</th>
+            <th class="c-name" data-sort="name">进程</th>
+            <th class="c-pid" data-sort="pid">PID</th>
+            <th class="c-path" data-sort="exe">路径</th>
+            <th class="c-sig" data-sort="sig">数字签名</th>
+            <th class="c-net" data-sort="conn">外联</th>
+            <th class="c-hit">命中规则</th>
+          </tr>
+        </thead>
+        <tbody id="procBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================== 系统制品 ===================== -->
+  <section class="panel tabpane" id="pane-art">
+    <div class="toolbar">
+      <div class="seg" id="segArtKind">
+        <button data-kind="all" class="on">全部</button>
+        <button data-kind="task">计划任务</button>
+        <button data-kind="service">服务</button>
+        <button data-kind="driver">驱动</button>
+        <button data-kind="hosts">hosts</button>
+        <button data-kind="registry">注册表</button>
+        <button data-kind="file">文件</button>
+      </div>
+      <span class="toolbar-info" id="artInfo"></span>
+    </div>
+    <div class="artlist" id="artList"></div>
+    <div class="art-empty" id="artEmpty">
+      <b>未发现异常系统制品</b>
+      <p>已检查：计划任务、系统服务、内核驱动、hosts 文件、Defender 排除项、注册表启动项、常驻目录文件。</p>
+    </div>
+  </section>
+
+  <!-- ===================== 告警 ===================== -->
+  <section class="panel tabpane" id="pane-alert">
+    <div class="timeline" id="alertList"></div>
+    <div class="art-empty" id="alertEmpty">
+      <b>暂无告警</b>
+      <p>监控期间新出现的高风险进程与系统制品异常会实时记录在此。</p>
+    </div>
+  </section>
+
+  <!-- ===================== 规则与 IOC ===================== -->
+  <section class="panel tabpane" id="pane-rules">
+    <h2 class="sec">安全状态 <span id="secChecked"></span></h2>
+    <div class="secgrid" id="secBox"></div>
+
+    <div class="two-col" style="margin-top:20px">
+      <div>
+        <h2 class="sec">检测规则库 <span id="ruleCount"></span></h2>
+        <div class="rulegrid" id="ruleList"></div>
+      </div>
+      <div>
+        <h2 class="sec">IOC 指标库 <span id="iocVer"></span></h2>
+        <div class="iocbox" id="iocBox"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ===================== 进程详情抽屉 ===================== -->
+<div class="drawer-mask" id="mask"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <div>
+      <h2 id="dName">—</h2>
+      <div class="drawer-sub" id="dSub">—</div>
+    </div>
+    <button class="iconbtn" id="dClose">✕</button>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+</aside>
+
+<!-- ===================== 确认弹窗 ===================== -->
+<div class="modal-mask" id="modalMask">
+  <div class="modal" id="modal">
+    <h3 id="mTitle">确认操作</h3>
+    <div id="mBody"></div>
+    <div class="modal-foot">
+      <button class="btn" id="mCancel">取消</button>
+      <button class="btn danger" id="mOk">确认</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

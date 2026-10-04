@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------- 运行时产物
+# 这些都是程序跑起来之后自己生成的，不进仓库
+python_path.txt
+runtime_port.txt
+runtime_token.txt
+instance.secret
+integrity.baseline.json
+reports/
+.app-window/
+app/whitelist.json
+
+# ---------------------------------------------------------------- 打包产物
+*.exe
+build/
+dist/
+*.spec
+
+# ---------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ---------------------------------------------------------------- 备份与临时文件
+备份/
+*.bak
+*.bak-*
+*.orig
+*.rej
+*.tmp
+*.log
+
+# ---------------------------------------------------------------- 编辑器与系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
