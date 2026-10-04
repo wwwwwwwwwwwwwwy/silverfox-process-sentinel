@@ -1,38 +1,41 @@
 @echo off
-chcp 936 >nul
-title 银狐进程监视器
+chcp 65001 >nul
+title SilverFox Process Sentinel
 cd /d "%~dp0"
 
 rem ============================================================
-rem  启动银狐进程监视器
-rem  需要 Python 3.11+，并且**该解释器**已安装 psutil
+rem  SilverFox Process Sentinel - launcher
+rem  Requires Python 3.11+ with psutil installed.
 rem
-rem  解释器查找顺序：
-rem    1. python_path.txt 里指定的路径（用 venv/conda 时写这里）
-rem    2. 项目内 runtime\pythonw.exe
-rem    3. Windows 官方 py 启动器（3.14 → 3.11 → 任意 3.x）
-rem    4. 系统 PATH 里的 pythonw
-rem  每个候选都会先验证 `import psutil` 是否成功。
+rem  Interpreter lookup order:
+rem    1. python_path.txt  (explicit path; use this for venv/conda)
+rem    2. runtime\pythonw.exe  (bundled portable Python)
+rem    3. Windows "py" launcher (3.14 -> 3.11 -> any 3.x)
+rem    4. pythonw on PATH
+rem  Every candidate is verified with `import psutil` before use.
+rem
+rem  NOTE: keep this file ASCII-only. cmd.exe reads .bat using the
+rem  console codepage; non-ASCII text would break on some systems.
 rem ============================================================
 
 if not exist "%~dp0app\main.py" (
   echo.
-  echo  [错误] 未找到 app\main.py，项目文件不完整。
-  echo  请保持本 bat 与 app 目录在同一文件夹内。
+  echo  [ERROR] app\main.py not found - the project files are incomplete.
+  echo  Keep this .bat in the same folder as the "app" directory.
   echo.
   pause
   exit /b 1
 )
 
-rem 注意：必须在这里读（setlocal enabledelayedexpansion 之前）：
-rem 延迟展开会把路径里的感叹号当成变量引用吞掉。
+rem Read the config BEFORE setlocal enabledelayedexpansion:
+rem delayed expansion would eat "!" characters inside the path.
 set "CFGPY="
 if exist "%~dp0python_path.txt" set /p CFGPY=<"%~dp0python_path.txt"
 
 setlocal enabledelayedexpansion
 set "PYEXE="
 
-rem 候选 1：python_path.txt 显式指定
+rem --- candidate 1: explicit path from python_path.txt ---
 if defined CFGPY (
   if exist "!CFGPY!" (
     "!CFGPY!" -c "import psutil" >nul 2>nul
@@ -40,13 +43,13 @@ if defined CFGPY (
   )
 )
 
-rem 候选 2：项目内随附的解释器
+rem --- candidate 2: bundled interpreter ---
 if not defined PYEXE if exist "%~dp0runtime\pythonw.exe" (
   "%~dp0runtime\pythonw.exe" -c "import psutil" >nul 2>nul
   if not errorlevel 1 set "PYEXE=%~dp0runtime\pythonw.exe"
 )
 
-rem 候选 3：官方 py 启动器，按版本从新到旧
+rem --- candidate 3: Windows py launcher ---
 if not defined PYEXE (
   for %%v in (3.14 3.13 3.12 3.11 3) do (
     if not defined PYEXE (
@@ -63,7 +66,7 @@ if not defined PYEXE (
   )
 )
 
-rem 候选 4：PATH 里的 pythonw
+rem --- candidate 4: pythonw on PATH ---
 if not defined PYEXE (
   for /f "delims=" %%i in ('where pythonw.exe 2^>nul') do (
     if not defined PYEXE (
@@ -75,24 +78,25 @@ if not defined PYEXE (
 
 if not defined PYEXE (
   echo.
-  echo  [错误] 没有找到「已安装 psutil 的 Python 3.11+」。
+  echo  [ERROR] No Python 3.11+ with psutil was found.
   echo.
-  echo  办法一：给系统 Python 装上 psutil
-  echo      安装 Python 3.11+（https://www.python.org/downloads/）
-  echo      安装时勾选 "Add Python to PATH"，然后执行：
-  echo          pip install psutil
+  echo  Option 1 - install psutil into your system Python:
+  echo      https://www.python.org/downloads/   ^(check "Add Python to PATH"^)
+  echo      pip install psutil
   echo.
-  echo  办法二：用 venv / conda 的话，在项目根目录建一个 python_path.txt，
-  echo          里面写解释器的完整路径，例如：
-  echo          D:\myenv\Scripts\pythonw.exe
+  echo  Option 2 - using venv / conda? Create python_path.txt in this
+  echo      folder containing the full path to the interpreter, e.g.
+  echo      D:\myenv\Scripts\pythonw.exe
   echo.
-  echo  提示：本机若装了多个 Python，请确认 psutil 装在了你要用的那个上。
+  echo  Tip: if several Pythons are installed, make sure psutil is
+  echo       installed for the one you intend to use.
   echo.
   pause
   exit /b 1
 )
 
-rem 把实际使用的解释器路径显示出来 —— 如果被换成了陌生的路径，一眼就能看见
-echo  使用解释器: !PYEXE!
+rem Show the interpreter actually used - if it was swapped for something
+rem unfamiliar, you will see it here.
+echo  Interpreter: !PYEXE!
 start "" "!PYEXE!" "%~dp0app\main.py"
 exit /b 0

@@ -1,7 +1,9 @@
 @echo off
-chcp 936 >nul
-title 银狐进程监视器 - 调试模式（显示日志）
+chcp 65001 >nul
+title SilverFox Process Sentinel - debug mode
 cd /d "%~dp0"
+
+rem Keep this file ASCII-only (see the main launcher for the reason).
 
 set "CFGPY="
 if exist "%~dp0python_path.txt" set /p CFGPY=<"%~dp0python_path.txt"
@@ -46,21 +48,21 @@ if not defined PYEXE (
 
 if not defined PYEXE (
   echo.
-  echo  [错误] 没有找到「已安装 psutil 的 Python 3.11+」。
-  echo  请安装 Python 3.11+ 并执行：  pip install psutil
-  echo  或在本目录建 python_path.txt 写明解释器完整路径。
+  echo  [ERROR] No Python 3.11+ with psutil was found.
+  echo  Install Python 3.11+ and run:  pip install psutil
+  echo  Or create python_path.txt here with the full interpreter path.
   echo.
   pause
   exit /b 1
 )
 
 echo ============================================================
-echo  使用解释器 : !PYEXE!
-echo  启动中，请稍候……界面会在首次扫描完成后自动打开
-echo  关闭本窗口即停止监视器
+echo  Interpreter : !PYEXE!
+echo  Starting... the window opens after the first scan.
+echo  Close this console window to stop the monitor.
 echo ============================================================
 echo.
 "!PYEXE!" "%~dp0app\main.py"
 echo.
-echo 监视器已退出。按任意键关闭窗口。
+echo Monitor exited. Press any key to close.
 pause >nul
