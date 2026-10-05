@@ -27,11 +27,15 @@
   </div>
 
   <div class="topbar-right">
-    <div class="pill" id="pillStatus"><i class="dot"></i><span>初始化</span></div>
+    <div class="pill" id="pillStatus"><i class="dot"></i><span data-t="pill_init">初始化</span></div>
     <div class="pill" id="pillAdmin"><i class="dot"></i><span>权限检测中</span></div>
     <div class="pill" id="pillUptime"><span>运行 00:00</span></div>
-    <button class="btn" id="btnScan">立即重扫</button>
-    <button class="btn primary" id="btnExport">导出报告</button>
+    <div class="seg langseg" id="langSeg" title="切换专业用语版 / 大白话版">
+      <button data-lang="pro">专业用语</button>
+      <button data-lang="plain" class="on">大白话</button>
+    </div>
+    <button class="btn" id="btnScan" data-t="btn_scan">立即重扫</button>
+    <button class="btn primary" id="btnExport" data-t="btn_export">导出报告</button>
   </div>
 </header>
 
@@ -39,24 +43,25 @@
   <section class="kpis" id="kpis"></section>
 
   <nav class="tabs">
-    <button class="tab active" data-tab="proc">进程监控 <em id="tabProcCount"></em></button>
-    <button class="tab" data-tab="net">网络监控 <em id="tabNetCount"></em></button>
-    <button class="tab" data-tab="art">系统痕迹 <em id="tabArtCount"></em></button>
-    <button class="tab" data-tab="alert">告警时间线 <em id="tabAlertCount"></em></button>
-    <button class="tab" data-tab="rules">规则与 IOC</button>
+    <button class="tab active" data-tab="proc"><span data-t="tab_proc">进程监控</span> <em id="tabProcCount"></em></button>
+    <button class="tab" data-tab="net"><span data-t="tab_net">网络监控</span> <em id="tabNetCount"></em></button>
+    <button class="tab" data-tab="art"><span data-t="tab_art">系统痕迹</span> <em id="tabArtCount"></em></button>
+    <button class="tab" data-tab="alert"><span data-t="tab_alert">告警时间线</span> <em id="tabAlertCount"></em></button>
+    <button class="tab" data-tab="rules"><span data-t="tab_rules">规则与 IOC</span></button>
   </nav>
 
   <!-- ===================== 进程监控 ===================== -->
   <section class="panel tabpane active" id="pane-proc">
     <div class="toolbar">
-      <input type="search" id="q" placeholder="搜索进程名 / 路径 / PID / 命令行…" autocomplete="off">
+      <input type="search" id="q" data-tph="ph_proc"
+             placeholder="搜索进程名 / 路径 / PID / 命令行…" autocomplete="off">
       <div class="seg" id="segLevel">
-        <button data-lv="all" class="on">全部</button>
-        <button data-lv="risky">仅异常</button>
-        <button data-lv="critical">严重</button>
-        <button data-lv="high">高危</button>
+        <button data-lv="all" class="on" data-t="seg_all">全部</button>
+        <button data-lv="risky" data-t="seg_risky">仅异常</button>
+        <button data-lv="critical" data-t="lv_critical">严重</button>
+        <button data-lv="high" data-t="lv_high">高危</button>
       </div>
-      <label class="chk"><input type="checkbox" id="chkConn"> 仅看有外联</label>
+      <label class="chk"><input type="checkbox" id="chkConn"> <span data-t="chk_conn">仅看有外联</span></label>
       <span class="toolbar-info" id="procInfo"></span>
     </div>
 
@@ -64,13 +69,13 @@
       <table class="grid" id="procTable">
         <thead>
           <tr>
-            <th class="c-risk" data-sort="score">风险</th>
-            <th class="c-name" data-sort="name">进程</th>
+            <th class="c-risk" data-sort="score" data-t="th_risk">风险</th>
+            <th class="c-name" data-sort="name" data-t="th_proc">进程</th>
             <th class="c-pid" data-sort="pid">PID</th>
-            <th class="c-path" data-sort="exe">路径</th>
-            <th class="c-sig" data-sort="sig">数字签名</th>
-            <th class="c-net" data-sort="conn">外联</th>
-            <th class="c-hit">命中规则</th>
+            <th class="c-path" data-sort="exe" data-t="th_path">路径</th>
+            <th class="c-sig" data-sort="sig" data-t="th_sig">数字签名</th>
+            <th class="c-net" data-sort="conn" data-t="th_net">外联</th>
+            <th class="c-hit" data-t="th_hit">命中规则</th>
           </tr>
         </thead>
         <tbody id="procBody"></tbody>
@@ -83,7 +88,7 @@
     <div class="netctl">
       <div class="netctl-main">
         <div class="netctl-head">
-          <span class="netctl-label">观测时长</span>
+          <span class="netctl-label" data-t="net_dur">观测时长</span>
           <span class="netctl-val" id="netDurVal">—</span>
           <span class="netctl-hint" id="netDurHint"></span>
         </div>
@@ -94,8 +99,8 @@
         </div>
       </div>
       <div class="netctl-acts">
-        <button class="btn primary" id="netStart">重新检测</button>
-        <button class="btn" id="netStop">停止</button>
+        <button class="btn primary" id="netStart" data-t="net_restart">重新检测</button>
+        <button class="btn" id="netStop" data-t="net_stop">停止</button>
       </div>
     </div>
 
@@ -106,13 +111,14 @@
 
     <div class="toolbar">
       <div class="seg" id="segNet">
-        <button data-nf="focus" class="on">重点关注</button>
-        <button data-nf="regular">仅高规律</button>
-        <button data-nf="risky">仅可疑</button>
-        <button data-nf="all">全部</button>
+        <button data-nf="focus" class="on" data-t="net_focus">重点关注</button>
+        <button data-nf="regular" data-t="net_regular">仅高规律</button>
+        <button data-nf="risky" data-t="net_risky">仅可疑</button>
+        <button data-nf="all" data-t="seg_all">全部</button>
       </div>
-      <input type="search" id="netQ" placeholder="搜索进程 / 远端 IP / 端口…" autocomplete="off">
-      <label class="chk"><input type="checkbox" id="chkNetBytes"> 仅看有数据传输</label>
+      <input type="search" id="netQ" data-tph="ph_net"
+             placeholder="搜索进程 / 远端 IP / 端口…" autocomplete="off">
+      <label class="chk"><input type="checkbox" id="chkNetBytes"> <span data-t="chk_bytes">仅看有数据传输</span></label>
       <span class="toolbar-info" id="netInfo"></span>
     </div>
 
@@ -120,12 +126,12 @@
       <table class="grid netgrid" id="netTable">
         <thead>
           <tr>
-            <th class="c-risk" data-nsort="score">风险</th>
-            <th class="c-reg" data-nsort="regularity">规律性</th>
-            <th class="c-name" data-nsort="name">进程</th>
-            <th class="c-remote" data-nsort="rip">远端地址</th>
-            <th class="c-bytes" data-nsort="bytes">流量 / 事件</th>
-            <th class="c-verdict">判定依据</th>
+            <th class="c-risk" data-nsort="score" data-t="th_risk">风险</th>
+            <th class="c-reg" data-nsort="regularity" data-t="th_reg">规律性</th>
+            <th class="c-name" data-nsort="name" data-t="th_proc">进程</th>
+            <th class="c-remote" data-nsort="rip" data-t="th_remote">远端地址</th>
+            <th class="c-bytes" data-nsort="bytes" data-t="th_bytes">流量 / 事件</th>
+            <th class="c-verdict" data-t="th_verdict">判定依据</th>
           </tr>
         </thead>
         <tbody id="netBody"></tbody>
@@ -133,7 +139,7 @@
     </div>
 
     <div class="art-empty" id="netEmpty">
-      <b>本时段未发现规律性异常的网络外联</b>
+      <b data-t="net_empty">本时段未发现规律性异常的网络外联</b>
       <p id="netEmptyWhy"></p>
     </div>
 
@@ -142,28 +148,23 @@
 
   <!-- ===================== 系统痕迹 ===================== -->
   <section class="panel tabpane" id="pane-art">
-    <div class="arthint">
-      <b>「系统痕迹」是什么</b>
-      木马除了"正在运行的进程"之外，还会在系统里留下<b>需要长期存在</b>的东西 ——
-      计划任务、系统服务、内核驱动、hosts 文件改动、注册表启动项与 Defender 排除项、
-      以及磁盘上落地的伪装文件。<b>进程被杀掉之后它们依然存在</b>，所以必须单独查、单独清。
-    </div>
+    <div class="arthint" id="artHint"></div>
     <div class="toolbar">
       <div class="seg" id="segArtKind">
-        <button data-kind="all" class="on">全部</button>
-        <button data-kind="task">计划任务</button>
-        <button data-kind="service">服务</button>
-        <button data-kind="driver">驱动</button>
-        <button data-kind="hosts">hosts</button>
-        <button data-kind="registry">注册表</button>
-        <button data-kind="file">文件</button>
+        <button data-kind="all" class="on" data-t="seg_all">全部</button>
+        <button data-kind="task" data-t="art_kind_task">计划任务</button>
+        <button data-kind="service" data-t="art_kind_service">服务</button>
+        <button data-kind="driver" data-t="art_kind_driver">驱动</button>
+        <button data-kind="hosts" data-t="art_kind_hosts">hosts</button>
+        <button data-kind="registry" data-t="art_kind_registry">注册表</button>
+        <button data-kind="file" data-t="art_kind_file">文件</button>
       </div>
       <span class="toolbar-info" id="artInfo"></span>
     </div>
     <div class="artlist" id="artList"></div>
     <div class="art-empty" id="artEmpty">
-      <b>未发现异常系统痕迹</b>
-      <p>已检查：计划任务、系统服务、内核驱动、hosts 文件、Defender 排除项、注册表启动项、常驻目录文件。</p>
+      <b data-t="art_empty_title">未发现异常系统痕迹</b>
+      <p data-t="art_empty_body"></p>
     </div>
   </section>
 
@@ -171,23 +172,24 @@
   <section class="panel tabpane" id="pane-alert">
     <div class="timeline" id="alertList"></div>
     <div class="art-empty" id="alertEmpty">
-      <b>暂无告警</b>
-      <p>监控期间新出现的高风险进程与系统制品异常会实时记录在此。</p>
+      <b data-t="alert_empty_title">暂无告警</b>
+      <p data-t="alert_empty_body"></p>
     </div>
   </section>
 
   <!-- ===================== 规则与 IOC ===================== -->
   <section class="panel tabpane" id="pane-rules">
-    <h2 class="sec">安全状态 <span id="secChecked"></span></h2>
+    <div class="arthint" id="rulesHint"></div>
+    <h2 class="sec"><span data-t="sec_status">安全状态</span> <span id="secChecked"></span></h2>
     <div class="secgrid" id="secBox"></div>
 
     <div class="two-col" style="margin-top:20px">
       <div>
-        <h2 class="sec">检测规则库 <span id="ruleCount"></span></h2>
+        <h2 class="sec"><span data-t="sec_rules">检测规则库</span> <span id="ruleCount"></span></h2>
         <div class="rulegrid" id="ruleList"></div>
       </div>
       <div>
-        <h2 class="sec">IOC 指标库 <span id="iocVer"></span></h2>
+        <h2 class="sec"><span data-t="sec_ioc">IOC 指标库</span> <span id="iocVer"></span></h2>
         <div class="iocbox" id="iocBox"></div>
       </div>
     </div>

@@ -554,3 +554,8 @@ table.netgrid tbody tr.reg-hi.high{box-shadow:inset 3px 0 0 0 var(--high)}
   color:#8fd6a8;background:rgba(63,185,80,.07);border-left:2px solid rgba(63,185,80,.4);
   white-space:pre-wrap;
 }
+
+/* ---------------------------------------------------- 语言切换开关 */
+.langseg{height:26px}
+.langseg button{padding:0 10px;font-size:11.5px;letter-spacing:.3px}
+.langseg button.on{background:linear-gradient(180deg,#2563eb,#1d4ed8)}
