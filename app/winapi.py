@@ -16,7 +16,11 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 from typing import Any
+
+import psutil
 
 # ---------------------------------------------------------------- 基础
 
@@ -30,20 +34,109 @@ def is_admin() -> bool:
         return False
 
 
+def _resolve_pwsh_from_store() -> str:
+    """从注册表取 PowerShell 7（MSIX/Store 包）的**真实**安装路径。
+
+    为什么不直接用 `%LOCALAPPDATA%\\Microsoft\\WindowsApps\\pwsh.exe`：
+    那是「应用执行别名」（AppExecLink 重解析点）。经它启动时，Windows 的激活
+    过程可能插入一个中转进程（broker/stub），于是：
+      · `subprocess.Popen` 拿到的 PID 可能是那个中转进程，真正的 pwsh 是它的子进程；
+      · 子进程的父进程也不是我们。
+    两者都会让"排除自身子进程"失效 —— 本工具会把自己的签名校验进程
+    判成 P010B + P011（高危），告警时间线里凭空多一条（实测发生过）。
+    直接启动真实 exe 就没有这个问题，顺带省掉一次 MSIX 激活开销。
+    """
+    try:
+        import winreg
+        base = (r"Software\Classes\Local Settings\Software\Microsoft"
+                r"\Windows\CurrentVersion\AppModel\Repository\Packages")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base) as k:
+            n = winreg.QueryInfoKey(k)[0]
+            best = ""
+            for i in range(n):
+                try:
+                    name = winreg.EnumKey(k, i)
+                except OSError:
+                    continue
+                if not name.lower().startswith("microsoft.powershell_"):
+                    continue
+                try:
+                    with winreg.OpenKey(k, name) as sk:
+                        root, _ = winreg.QueryValueEx(sk, "PackageRootFolder")
+                except OSError:
+                    continue
+                exe = os.path.join(str(root), "pwsh.exe")
+                if os.path.isfile(exe):
+                    best = max(best, exe)      # 装了多个版本时取字典序最大的
+            return best
+    except Exception:
+        return ""
+
+
 def _find_powershell() -> str:
-    """优先 pwsh（PowerShell 7），回退 powershell.exe（5.1，系统必备）。"""
+    """优先 pwsh（PowerShell 7），回退 powershell.exe（5.1，系统必备）。
+
+    ⚠️ 三点必须遵守（都是实测踩出来的）：
+      1. 返回**绝对路径**，不要返回裸名字 —— 裸名字要走 PATH 解析，
+         而 PATH 可能被第三方 shim 目录改写（实测本机 PATH 首项是无效的 `D;`）。
+      2. **真实安装路径优先于「应用执行别名」** —— 原因见 _resolve_pwsh_from_store。
+      3. 别名只作次选，系统自带 powershell.exe 兜底。
+    """
     cands = [
-        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe"),
         os.path.expandvars(r"%ProgramFiles%\PowerShell\7\pwsh.exe"),
-        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        _resolve_pwsh_from_store(),
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe"),
+        os.path.expandvars(r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"),
     ]
     for c in cands:
-        if os.path.isfile(c):
+        if c and os.path.isfile(c):
             return c
-    return "powershell.exe"
+    return "powershell.exe"          # 最后兜底，交给系统解析
 
 
 PS_EXE = _find_powershell()
+
+# ---------------------------------------------------------------- 自身辅助进程登记
+# 为什么需要按 PID 单独登记，而不是只靠"父进程 == 自己"：
+#   实测有两种情况会让子进程的 ppid **不等于**本进程 ——
+#     ① venv 的 pythonw.exe 是启动器，会再派生一个真解释器，os.getpid() 是后者；
+#     ② 经 WindowsApps 的 pwsh.exe「应用执行别名」启动时，激活可能经过 broker。
+#   两者都会让 rules.is_own_aux_process 的父进程判据失效，于是**本工具自己的
+#   签名校验进程**被判成 P010B（Base64 执行）+ P011（绕过策略）→ 告警时间线里
+#   凭空出现一条"高危"（实测发生过）。
+#
+# 按 (pid, create_time) 精确排除的好处：
+#   · 不受父进程关系影响（broker / 启动器都不怕）；
+#   · **不给攻击者留伪造空间** —— 父进程链是可以伪造的，PID + 创建时间不能；
+#     所以这里绝不能改成"命令行里含本工具 preamble 就放过"那种宽松判据。
+_OWN_CHILDREN: dict[int, tuple[float, float]] = {}   # pid -> (create_time, 登记时刻)
+_OWN_CHILDREN_LOCK = threading.Lock()
+_OWN_CHILDREN_KEEP = 900.0        # 保留 15 分钟（覆盖"进程已退出、快照还没评分"的窗口）
+_OWN_CHILDREN_MAX = 500
+
+
+def _own_child_register(pid: int) -> None:
+    ct = 0.0
+    try:
+        ct = psutil.Process(pid).create_time()
+    except Exception:
+        pass
+    with _OWN_CHILDREN_LOCK:
+        _OWN_CHILDREN[pid] = (ct, time.time())
+        if len(_OWN_CHILDREN) > _OWN_CHILDREN_MAX:
+            for k in list(_OWN_CHILDREN)[:len(_OWN_CHILDREN) - _OWN_CHILDREN_MAX]:
+                _OWN_CHILDREN.pop(k, None)
+
+
+def own_child_create_times() -> dict[int, float]:
+    """返回 {pid: create_time}，供规则引擎排除本工具自己拉起的辅助进程。"""
+    now = time.time()
+    with _OWN_CHILDREN_LOCK:
+        for pid in list(_OWN_CHILDREN):
+            if now - _OWN_CHILDREN[pid][1] > _OWN_CHILDREN_KEEP:
+                del _OWN_CHILDREN[pid]
+        return {pid: ct for pid, (ct, _) in _OWN_CHILDREN.items()}
+
 
 _PS_PREAMBLE = (
     "$ErrorActionPreference='SilentlyContinue';"
@@ -51,28 +144,135 @@ _PS_PREAMBLE = (
     "try{[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)}catch{};"
 )
 
+# ---------------------------------------------------------------- 子进程随父退出
+# 为什么需要 Job Object：
+#   监视器被**强制结束**（任务管理器结束任务、父进程被杀）时，正在跑的校验子进程
+#   不会被回收，会变成**孤儿**继续挂着。它的命令行里带着本工具的 preamble，
+#   而父进程已经不是监视器了 —— 于是下一次扫描（可能是新起的实例）会把它判成
+#   P010B + P011 = 高危，告警时间线里凭空多一条假告警。**实测发生过**：
+#   本机曾残留一个孤儿 pwsh.exe（命令行含本工具 preamble、父进程已死）。
+#   把子进程放进带 KILL_ON_JOB_CLOSE 的 Job 对象，父进程一消失由内核连带清掉，
+#   从根上消灭这一类残留。
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_HANDLE = None
+_JOB_LOCK = threading.Lock()
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong)]
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32)]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+def _own_job():
+    """惰性创建「父进程退出即杀掉全部子进程」的 Job 对象。失败返回 0（静默降级）。"""
+    global _JOB_HANDLE
+    with _JOB_LOCK:
+        if _JOB_HANDLE is not None:
+            return _JOB_HANDLE
+        _JOB_HANDLE = 0
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateJobObjectW.restype = ctypes.c_void_p
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+            h = k32.CreateJobObjectW(None, None)
+            if h:
+                info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+                info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                k32.SetInformationJobObject.restype = ctypes.c_int
+                k32.SetInformationJobObject.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+                if k32.SetInformationJobObject(
+                        h, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                        ctypes.byref(info), ctypes.sizeof(info)):
+                    _JOB_HANDLE = h
+        except Exception:
+            _JOB_HANDLE = 0
+        return _JOB_HANDLE
+
+
+def _assign_to_own_job(pid: int) -> None:
+    """把刚拉起的子进程放进 Job。失败无所谓（只是失去"随父退出"的保障）。"""
+    h = _own_job()
+    if not h:
+        return
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.AssignProcessToJobObject.restype = ctypes.c_int
+        k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        # PROCESS_TERMINATE(0x0001) | PROCESS_SET_QUOTA(0x0100)
+        hp = k32.OpenProcess(0x0001 | 0x0100, False, pid)
+        if hp:
+            k32.AssignProcessToJobObject(h, hp)
+            k32.CloseHandle(hp)
+    except Exception:
+        pass
+
 
 def run_ps(script: str, timeout: int = 60, extra_env: dict | None = None) -> str:
     """执行 PowerShell 片段，返回 UTF-8 文本。脚本以 UTF-16LE base64 传入，
     不含任何引号/中文编码风险。extra_env 用于把文件路径等数据经环境变量传入，
-    彻底避免任何路径拼接注入（加固：即使 %TEMP% 路径含单引号/反引号/$ 也安全）。"""
+    彻底避免任何路径拼接注入（加固：即使 %TEMP% 路径含单引号/反引号/$ 也安全）。
+
+    用 Popen 而不是 run：需要在进程启动的瞬间就
+      ① 把 PID 登记进 _OWN_CHILDREN（供规则引擎精确排除）；
+      ② 把它放进 Job 对象（保证监视器被强制结束时它一起被回收，不留孤儿）。
+    """
     full = _PS_PREAMBLE + script
     encoded = base64.b64encode(full.encode("utf-16-le")).decode("ascii")
     env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
     try:
-        p = subprocess.run(
+        p = subprocess.Popen(
             [PS_EXE, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-EncodedCommand", encoded],
-            capture_output=True, timeout=timeout, creationflags=CREATE_NO_WINDOW,
-            env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW, env=env,
         )
-    except subprocess.TimeoutExpired:
-        return ""
     except Exception:
         return ""
-    raw = p.stdout or b""
+    _own_child_register(p.pid)
+    _assign_to_own_job(p.pid)
+    try:
+        out, _err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            p.kill()
+            out, _err = p.communicate(timeout=5)
+        except Exception:
+            out = b""
+    except Exception:
+        out = b""
+    raw = out or b""
     for enc in ("utf-8", "utf-8-sig", "gbk"):
         try:
             return raw.decode(enc)

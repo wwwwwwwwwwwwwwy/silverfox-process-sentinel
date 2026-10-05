@@ -375,13 +375,62 @@ def bin_from_binpath(binpath: str) -> str:
 # P 系列 —— 进程行为
 # ================================================================
 
+def is_own_aux_process(proc: dict, ctx: dict) -> bool:
+    """判断是否为本工具**自己拉起的辅助进程**（签名校验用的 PowerShell 等）。
+
+    为什么需要这个：本工具的签名校验要调用 PowerShell `-EncodedCommand`，
+    这天然命中 P010B（Base64 执行）+ P011（绕过执行策略）。不排除的话，
+    工具会把自己的校验进程报成"高危"（实测发生过，告警时间线里凭空多一条）。
+
+    三重判据，任一命中即排除：
+      ① `(pid, create_time)` 在"本工具拉起的子进程"登记表里 —— 精确且**不可伪造**；
+      ② 直接父进程是本进程；
+      ③ 祖先链上有本进程（最多回溯 6 层）。
+
+    ⚠️ 为什么不能只看父进程：实测有两种情况让 ppid ≠ 本进程 ——
+      · venv 的 `pythonw.exe` 是启动器，会再派生一个真解释器（`os.getpid()` 是后者）；
+      · 经 `%LOCALAPPDATA%\\Microsoft\\WindowsApps\\pwsh.exe` 这个 MSIX「应用执行别名」
+        启动时，激活可能经过 broker，子进程的父进程不是我们。
+    两者都会让旧版"父进程 == 自己"的判据静默失效。
+
+    ⚠️ 判据绝不能放宽成"命令行里含本工具 preamble 就放过" ——
+    那是一条**免杀通道**：攻击者读一遍源码就能把自己的 PowerShell 前缀成同样的
+    preamble，从此对本工具隐身。父进程链可以伪造，PID + 创建时间不能。
+    """
+    self_pid = ctx.get("self_pid") or 0
+    if not self_pid:
+        return False
+
+    own = ctx.get("own_children") or {}
+    pid = proc.get("pid")
+    if pid in own:
+        ct = proc.get("create_time") or 0
+        oct_ = own.get(pid) or 0
+        # 比对创建时间：PID 会被系统回收再分配，只比 PID 会误伤复用该号的新进程
+        if not ct or not oct_ or abs(ct - oct_) < 1.5:
+            return True
+
+    by_pid = ctx.get("by_pid") or {}
+    cur = proc.get("ppid") or 0
+    for _ in range(6):
+        if not cur or cur in (0, 4):
+            return False
+        if cur == self_pid:
+            return True
+        parent = by_pid.get(cur)
+        if not parent:
+            return False
+        cur = parent.get("ppid") or 0
+    return False
+
+
 def rules_process(proc: dict, ctx: dict) -> list[dict]:
     fs: list[dict] = []
 
     # 排除本工具自己拉起的辅助进程。
     # 签名校验会调用 PowerShell（-EncodedCommand），这些子进程的命令行天然带高危特征；
     # 若不排除，工具会把自己的校验进程判成"严重风险"（实测确实发生过）。
-    if ctx.get("self_pid") and proc.get("ppid") == ctx["self_pid"]:
+    if is_own_aux_process(proc, ctx):
         return fs
 
     name = (proc.get("name") or "")

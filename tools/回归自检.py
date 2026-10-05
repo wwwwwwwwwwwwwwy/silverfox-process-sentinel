@@ -493,6 +493,179 @@ for _mod, _path in (("netmon", os.path.join(_common.app_dir(), "netmon.py")),
             if k in _src]
     check(f"{_mod} 不含任何网络客户端/外联调用", not _bad, f"发现 {_bad}")
 
+# 11. 本工具自身辅助进程的排除
+#     —— 背景：告警时间线里出现过一条"高危"，实为本工具的签名校验子进程。
+#        根因是旧判据只看直接父进程，而 venv 启动器与 MSIX 应用执行别名
+#        都会让 ppid ≠ 本进程。这里把三重判据与"免杀通道"底线一起固化。
+print()
+print("=" * 72)
+print("自身辅助进程排除 —— 父进程判据失效时仍必须排除")
+print("=" * 72)
+import threading  # noqa: E402
+import time  # noqa: E402
+import psutil  # noqa: E402
+import winapi as _w2  # noqa: E402
+
+# 本工具固定把 _PS_PREAMBLE 放在脚本最前，再整体 base64(UTF-16LE) 传给 PowerShell。
+# 所以命令行里必然出现该 preamble 的 base64 前缀 —— 这是**测试用**的精确标识，
+# 绝不能拿它当排除判据（那就成了免杀通道，见下面的守卫断言）。
+import base64 as _b64  # noqa: E402
+_PS_MARK = _b64.b64encode(_w2._PS_PREAMBLE.encode("utf-16-le")).decode()[:48]
+
+_SELF = 12345
+_CTX0 = {"by_pid": {}, "sig_cache": {}, "artifacts": {}, "self_pid": _SELF,
+         "own_children": {}}
+
+
+def _mkp(pid, ppid, ct=1000.0, cmd="x", exe=r"C:\x.exe"):
+    return {"pid": pid, "ppid": ppid, "name": "pwsh.exe", "exe": exe, "dir": "C:\\",
+            "ext": ".exe", "cmdline": [cmd], "cmdline_str": cmd,
+            "cmdline_loaded": True, "username": "", "parent_name": "",
+            "create_time": ct, "rss_mb": 1, "threads": 1, "status": "", "cpu": 0,
+            "signature": {"kind": "ok", "cn": "Microsoft Corporation"},
+            "connections": []}
+
+
+check("判据②：直接父进程是本进程 → 排除",
+      rules.is_own_aux_process(_mkp(100, _SELF), _CTX0))
+
+_CTX_CHAIN = dict(_CTX0, by_pid={500: {"pid": 500, "ppid": _SELF}})
+check("判据③：祖先链上有本进程（venv 启动器多派生一层）→ 排除",
+      rules.is_own_aux_process(_mkp(100, 500), _CTX_CHAIN))
+
+_CTX_OWN = dict(_CTX0, own_children={100: 1000.0})
+check("判据①：(pid, 创建时间) 命中登记表（broker 激活、父进程不是自己）→ 排除",
+      rules.is_own_aux_process(_mkp(100, 999, ct=1000.0), _CTX_OWN))
+check("判据①：登记表 PID 相同但创建时间不同（PID 被系统回收）→ 不排除",
+      not rules.is_own_aux_process(_mkp(100, 999, ct=9999.0), _CTX_OWN))
+check("完全无关的进程 → 不排除", not rules.is_own_aux_process(_mkp(100, 999), _CTX0))
+
+# ⛔ 免杀通道守卫：把判据放宽成"命令行含本工具 preamble 就放过"会让攻击者
+#    读一遍源码就能隐身。这条断言就是防止日后有人那样"简化"。
+_EVADE = _mkp(100, 999,
+              cmd="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                  "-EncodedCommand JABFAHIAcgBvAHIAQQBjAHQAaQBvAG4AUAByAGUAZgBlAHIAZQBuAGMAZQA9",
+              exe=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+_ev_ids = [f["rule_id"] for f in rules.rules_process(_EVADE, _CTX0)]
+check("⛔ 仅凭「命令行含本工具 preamble」不得免除告警（防免杀通道）",
+      "P010B" in _ev_ids or "P011" in _ev_ids, f"命中 {_ev_ids or '无'}")
+
+check("PS_EXE 是绝对路径（不靠 PATH 解析）", os.path.isabs(_w2.PS_EXE), _w2.PS_EXE)
+check("PS_EXE 实际存在", os.path.isfile(_w2.PS_EXE), _w2.PS_EXE)
+check("PS_EXE 指向真实安装路径，而不是 MSIX 应用执行别名",
+      r"\Microsoft\WindowsApps" not in _w2.PS_EXE, _w2.PS_EXE)
+
+# 端到端（确定性写法）：run_ps 必须把自己的子进程登记进表，且该进程判为无命中。
+# 不用"边跑边抓进程表"那种写法 —— 20ms 轮询仍可能错过短命进程，会造成假失败。
+_own_before = set(_w2.own_child_create_times())
+_w2.run_ps("$null")
+_own_after = _w2.own_child_create_times()
+_new_own = set(_own_after) - _own_before
+check("run_ps 会把自己拉起的子进程登记进表", len(_new_own) >= 1,
+      f"新增 {sorted(_new_own)}，表内共 {len(_own_after)} 个")
+
+for _pid in sorted(_new_own):
+    _proc = {"pid": _pid, "ppid": 999999, "name": "pwsh.exe",     # 故意给个无关父进程
+             "exe": _w2.PS_EXE, "dir": os.path.dirname(_w2.PS_EXE), "ext": ".exe",
+             "cmdline": [_w2.PS_EXE, "-EncodedCommand", _PS_MARK],
+             "cmdline_str": f"{_w2.PS_EXE} -NoProfile -NonInteractive "
+                            f"-ExecutionPolicy Bypass -EncodedCommand {_PS_MARK}",
+             "cmdline_loaded": True, "username": "", "parent_name": "",
+             "create_time": _own_after.get(_pid) or 0, "rss_mb": 1, "threads": 1,
+             "status": "", "cpu": 0,
+             "signature": {"kind": "ok", "cn": "Microsoft Corporation"},
+             "connections": []}
+    _ctx_own = {"by_pid": {}, "sig_cache": {}, "artifacts": {}, "self_pid": os.getpid(),
+                "own_children": _own_after}
+    _ids2 = [x["rule_id"] for x in rules.rules_process(_proc, _ctx_own)]
+    check(f"端到端：已登记的校验子进程 pid={_pid} 被判为无命中", not _ids2,
+          f"命中 {_ids2 or '无'}")
+
+# 端到端：**父进程被强制结束时，子进程必须一起消失（不留孤儿）**。
+# 这是误报的真正源头 —— 孤儿 PowerShell 的父进程不再是监视器，排除判据失效，
+# 下次扫描就会把它报成高危。用 Job Object 的 KILL_ON_JOB_CLOSE 从根上解决。
+# 辅助进程用 os._exit(0) 直接终止（模拟"被强制结束"，不跑任何清理代码）。
+import subprocess as _sp  # noqa: E402
+_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_orphan_helper.py")
+_HLOG = _HELPER + ".log"
+io.open(_HELPER, "w", encoding="utf-8").write(
+    "# -*- coding: utf-8 -*-\n"
+    "import os, sys, threading, time, traceback\n"
+    "LOG = r'" + _HLOG + "'\n"
+    "def log(m):\n"
+    "    with open(LOG, 'a', encoding='utf-8') as f: f.write(str(m) + '\\n')\n"
+    "open(LOG, 'w', encoding='utf-8').close()\n"
+    "log('helper start pid=%d' % os.getpid())\n"
+    "sys.path.insert(0, r'" + _common.app_dir() + "')\n"
+    "import winapi\n"
+    "log('winapi imported, PS_EXE=%s' % winapi.PS_EXE)\n"
+    "def go():\n"
+    "    try:\n"
+    "        out = winapi.run_ps('Start-Sleep -Seconds 90')\n"
+    "        log('run_ps returned len=%d' % len(out))\n"
+    "    except Exception:\n"
+    "        log('run_ps raised: ' + traceback.format_exc())\n"
+    "threading.Thread(target=go, daemon=True).start()\n"
+    "time.sleep(6)\n"
+    "log('helper exiting via os._exit(0)')\n"
+    "os._exit(0)          # 不做任何清理，模拟被强杀\n")
+try:
+    os.remove(_HLOG)
+except Exception:
+    pass
+_before_pids = set(psutil.pids())
+_hp = _sp.Popen([sys.executable, _HELPER], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+_orphan_pid = 0
+_t0 = time.time()
+# ⚠️ 必须先按**进程名**过滤再读命令行。直接对全部进程读 cmdline，
+#    遇到受保护进程（LsaIso/NgcIso 等）每次要阻塞约 1 秒，一轮就要 6–8 秒，
+#    会把 6 秒的观测窗口整个错过（第一版就是这么假失败的）。
+while time.time() - _t0 < 25 and not _orphan_pid:
+    for _pr in psutil.process_iter(["pid", "name"]):
+        if (_pr.info["name"] or "").lower() not in ("pwsh.exe", "powershell.exe"):
+            continue
+        if _pr.info["pid"] in _before_pids:
+            continue
+        try:
+            _cl = " ".join(_pr.cmdline() or [])
+        except Exception:
+            continue
+        if _PS_MARK in _cl:
+            _orphan_pid = _pr.info["pid"]
+            break
+    time.sleep(0.05)
+_hlog = ""
+if not _orphan_pid:
+    try:
+        _hlog = io.open(_HLOG, encoding="utf-8").read()[:400]
+    except Exception as e:
+        _hlog = f"<日志读取失败 {e}>"
+check("孤儿测试：辅助进程成功拉起了校验子进程", bool(_orphan_pid),
+      f"pid={_orphan_pid}  解释器={sys.executable}"
+      + (f"\n        辅助进程日志：{_hlog}" if _hlog else ""))
+if _orphan_pid:
+    # 辅助进程会在 6 秒后自己 os._exit(0)
+    _t0 = time.time()
+    while time.time() - _t0 < 15 and _hp.poll() is None:
+        time.sleep(0.2)
+    check("孤儿测试：辅助进程已自我终止（模拟被强杀）", _hp.poll() is not None,
+          f"返回码 {_hp.poll()}")
+    _t0 = time.time()
+    while time.time() - _t0 < 15 and psutil.pid_exists(_orphan_pid):
+        time.sleep(0.2)
+    _alive = psutil.pid_exists(_orphan_pid)
+    check("★ 父进程被强杀后，校验子进程被内核连带回收（不留孤儿）", not _alive,
+          f"pid={_orphan_pid} " + ("仍存活 → 会变成误报源" if _alive else "已消失"))
+else:
+    try:
+        _hp.kill()
+    except Exception:
+        pass
+try:
+    os.remove(_HELPER)
+except Exception:
+    pass
+
 print()
 print("=" * 72)
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")

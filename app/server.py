@@ -434,6 +434,10 @@ class Monitor:
             "sig_cache": self.sig_cache,
             "artifacts": getattr(self, "artifacts", {}),
             "self_pid": os.getpid(),      # 用于排除本工具自己拉起的辅助进程
+            # 本工具拉起的子进程登记表（pid → 创建时间）。
+            # 只靠"父进程 == 自己"不够 —— venv 启动器与 MSIX 应用执行别名
+            # 都会让 ppid 不等于本进程，详见 rules.is_own_aux_process。
+            "own_children": winapi.own_child_create_times(),
         }
 
     def _score_all(self):
@@ -474,6 +478,11 @@ class Monitor:
             "score": p["score"],
             "name": p["name"],
             "pid": p["pid"],
+            # 记下父进程与自身 PID：排查"本工具把自己的辅助进程报成高危"这类
+            # 误报时，这两项是唯一能定位根因的线索（实测靠它定位过）。
+            "ppid": p.get("ppid") or 0,
+            "parent": p.get("parent_name") or "",
+            "self_pid": os.getpid(),
             "exe": p.get("exe", ""),
             "rules": [{"id": f["rule_id"], "title": f["title"],
                        "severity": f["severity"], "evidence": f["evidence"]} for f in top],
@@ -617,6 +626,10 @@ class Monitor:
                     "net_enabled": self.netmon is not None,
                     "net_estats": bool(net and net.get("estats")),
                     "net_sample_interval": (net or {}).get("sample_interval"),
+                    # 自身辅助进程排除的可观测性：把"本进程 PID"和"已登记的辅助子进程数"
+                    # 显示出来，用户与开发者都能据此核对"工具会不会误报自己"。
+                    "self_pid": os.getpid(),
+                    "own_children": len(winapi.own_child_create_times()),
                 },
                                 # 已知项随 state 一起下发：前端 poll() 会整体替换 STATE，
                 # 单独 fetch 挂在 STATE 上的字段会被下一轮冲掉（实测踩过）。
