@@ -538,3 +538,11 @@ table.netgrid tbody tr.reg-hi.high{box-shadow:inset 3px 0 0 0 var(--high)}
   font-size:10px;padding:1px 6px;border-radius:4px;
   color:var(--cyan);background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.32);
 }
+
+/* ---------------------------------------------------- 系统痕迹说明条 */
+.arthint{
+  font-size:12px;line-height:1.7;color:var(--muted);
+  background:rgba(19,31,51,.6);border-left:2px solid var(--border-2);
+  padding:10px 13px;border-radius:8px;margin-bottom:11px;
+}
+.arthint b{color:var(--text-2)}

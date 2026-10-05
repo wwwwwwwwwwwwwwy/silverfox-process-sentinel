@@ -41,7 +41,7 @@
   <nav class="tabs">
     <button class="tab active" data-tab="proc">进程监控 <em id="tabProcCount"></em></button>
     <button class="tab" data-tab="net">网络监控 <em id="tabNetCount"></em></button>
-    <button class="tab" data-tab="art">系统制品 <em id="tabArtCount"></em></button>
+    <button class="tab" data-tab="art">系统痕迹 <em id="tabArtCount"></em></button>
     <button class="tab" data-tab="alert">告警时间线 <em id="tabAlertCount"></em></button>
     <button class="tab" data-tab="rules">规则与 IOC</button>
   </nav>
@@ -140,8 +140,14 @@
     <div class="netnotes" id="netNotes"></div>
   </section>
 
-  <!-- ===================== 系统制品 ===================== -->
+  <!-- ===================== 系统痕迹 ===================== -->
   <section class="panel tabpane" id="pane-art">
+    <div class="arthint">
+      <b>「系统痕迹」是什么</b>
+      木马除了"正在运行的进程"之外，还会在系统里留下<b>需要长期存在</b>的东西 ——
+      计划任务、系统服务、内核驱动、hosts 文件改动、注册表启动项与 Defender 排除项、
+      以及磁盘上落地的伪装文件。<b>进程被杀掉之后它们依然存在</b>，所以必须单独查、单独清。
+    </div>
     <div class="toolbar">
       <div class="seg" id="segArtKind">
         <button data-kind="all" class="on">全部</button>
@@ -156,7 +162,7 @@
     </div>
     <div class="artlist" id="artList"></div>
     <div class="art-empty" id="artEmpty">
-      <b>未发现异常系统制品</b>
+      <b>未发现异常系统痕迹</b>
       <p>已检查：计划任务、系统服务、内核驱动、hosts 文件、Defender 排除项、注册表启动项、常驻目录文件。</p>
     </div>
   </section>

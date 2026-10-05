@@ -1074,21 +1074,93 @@ def ioc_catalog() -> dict:
 # 报告导出
 # ================================================================
 
-def export_report(m: Monitor) -> str:
+# ================================================================
+# 排查报告
+# ================================================================
+# ⚠️ 报告的核心约束：**顶部所有数字必须与下方表格逐行对应**。
+#    初版把顶部 KPI 的计数直接取自 summary，而表格行是另外循环出来的，
+#    两边口径不同（KPI 只按"进程"分等级，表格却还列了系统痕迹）——
+#    于是同一份报告上写着「高危 0」，下面却列出一堆「高危」行。
+#    这类自相矛盾比少报更伤可信度：试用者会立刻不再相信任何数字。
+#    现在计数与表格行都由 report_buckets() 产出，改一处即同时改两处。
+
+_KIND_ZH = {
+    "task": "计划任务", "service": "系统服务", "driver": "内核驱动",
+    "hosts": "hosts 文件", "registry": "注册表", "file": "文件特征",
+}
+_LEVELS = ("critical", "high", "medium", "low")
+
+
+def _tally(items) -> dict:
+    c = {k: 0 for k in _LEVELS}
+    c["clean"] = 0
+    for it in items:
+        lv = (it or {}).get("level") or "clean"
+        c[lv] = c.get(lv, 0) + 1
+    return c
+
+
+def report_buckets(st: dict) -> dict:
+    """报告里三张表的**行**与**计数** —— 全报告唯一的数字来源。
+
+    网络部分有两类行：
+      · `nets`  有规则命中的（计入风险等级）
+      · `watch` 规律性 ≥55 但无旁证命中的「观察项」（只展示，不计入风险）
+    分开计数并在标题里写明，避免"看着像告警、其实不算风险"的误读。
+    """
+    procs = [p for p in (st.get("processes") or []) if (p.get("level") or "clean") != "clean"]
+    arts = list(st.get("artifacts") or [])
+    flows = ((st.get("net") or {}).get("flows") or [])
+    nets = [f for f in flows if (f.get("level") or "clean") != "clean"]
+    watch = [f for f in flows
+             if (f.get("level") or "clean") == "clean" and (f.get("regularity") or 0) >= 55]
+
+    c_proc, c_art, c_net = _tally(procs), _tally(arts), _tally(nets)
+    c_all = {k: c_proc[k] + c_art[k] + c_net[k] for k in _LEVELS}
+    return {
+        "procs": procs, "arts": arts, "nets": nets, "watch": watch,
+        "c_proc": c_proc, "c_art": c_art, "c_net": c_net, "c_all": c_all,
+        "rows": len(procs) + len(arts) + len(nets),
+        "need_action": c_all["critical"] + c_all["high"],
+    }
+
+
+def build_report_html(st: dict) -> str:
+    """由一份 state 快照生成 HTML 报告。
+
+    纯函数（只读 st、不碰文件系统）—— 这样可以用合成数据做回归测试，
+    专门盯住"顶部数字与下方表格不一致"这类问题。
+    """
     import iocs
-    os.makedirs(REPORT_DIR, exist_ok=True)
-    st = m.state()
+
     s = st["summary"]
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(REPORT_DIR, f"银狐排查报告-{ts}.html")
+    b = report_buckets(st)
+    ca, cp, car, cn = b["c_all"], b["c_proc"], b["c_art"], b["c_net"]
+    net = st.get("net") or {}
+    ns = net.get("summary") or {}
+    nses = net.get("session") or {}
 
     def esc(x):
         return (str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
+    # ---- 结论：与上方计数同源，且覆盖"只有中危/低危"的情况
+    #（初版只在 critical/high 时才有话说，于是"有中危"也会显示"未发现高风险特征"）
+    if ca["critical"]:
+        concl = ('<b style="color:#ff5c5c">发现严重风险项，高度疑似银狐木马活动，'
+                 '请立即断网并处置。</b>')
+    elif ca["high"]:
+        concl = '<b style="color:#ffa53d">存在高危异常项，建议逐条核查。</b>'
+    elif ca["medium"]:
+        concl = ('<b style="color:#ffd666">存在若干中危可疑项，建议核对后决定是否处置。</b>')
+    elif ca["low"]:
+        concl = '<b style="color:#63b3ff">仅有低危观察项，通常无需处置。</b>'
+    else:
+        concl = ('本轮扫描未发现银狐相关风险特征。注意：本工具基于行为特征，'
+                 '不能替代杀毒软件全盘扫描。')
+
+    # ---- 二、异常进程
     rows = []
-    for p in st["processes"]:
-        if p["level"] == "clean":
-            continue
+    for p in b["procs"]:
         rows.append(
             "<tr>"
             f"<td class='sev {p['level']}'>{rules.SEVERITY_ZH.get(p['level'],'')}</td>"
@@ -1097,43 +1169,28 @@ def export_report(m: Monitor) -> str:
             f"<td>{esc(rules.sig_label(p))}</td>"
             f"<td>{esc('；'.join(f['title'] for f in p['findings']))}</td>"
             "</tr>")
+
+    # ---- 三、系统痕迹
     arows = []
-    for a in st["artifacts"]:
+    for a in b["arts"]:
+        kind = _KIND_ZH.get(a.get("kind", ""), a.get("kind", ""))
         arows.append(
             "<tr>"
             f"<td class='sev {a['level']}'>{rules.SEVERITY_ZH.get(a['level'],'')}</td>"
-            f"<td>{a['score']}</td><td>{esc(a['kind'])}</td><td>{esc(a['title'])}</td>"
+            f"<td>{a['score']}</td><td>{esc(kind)}</td><td>{esc(a['title'])}</td>"
             f"<td class='path'>{esc(a.get('subtitle',''))}</td>"
             f"<td>{esc('；'.join(f['title'] for f in a['findings']))}</td>"
             "</tr>")
 
-    detail_blocks = []
-    for p in st["processes"]:
-        if p["level"] not in ("critical", "high"):
-            continue
-        items = "".join(
-            f"<li><b>[{f['rule_id']}] {esc(f['title'])}</b>"
-            f"<div class='ev'>{esc(f['evidence'])}</div>"
-            f"<div class='ad'>{esc(f['advice'])}</div></li>"
-            for f in p["findings"])
-        detail_blocks.append(
-            f"<div class='card'><h3>{esc(p['name'])} <span class='pid'>PID {p['pid']}</span>"
-            f"<span class='sev {p['level']}'>{rules.SEVERITY_ZH.get(p['level'],'')} · {p['score']}分</span></h3>"
-            f"<div class='path'>{esc(p['exe'])}</div>"
-            f"<div class='path'>命令行：{esc(p['cmdline_str'][:300])}</div>"
-            f"<ul>{items}</ul></div>")
-
-    # ---- 网络心跳检测章节 ----
-    net = st.get("net") or {}
-    ns = net.get("summary") or {}
-    nses = net.get("session") or {}
-    net_rows = []
-    for f in (net.get("flows") or []):
-        if f["level"] == "clean" and (f.get("regularity") or 0) < 55:
-            continue
-        net_rows.append(
+    # ---- 四、网络外联
+    nrows = []
+    for f in (b["nets"] + b["watch"]):
+        lv = f.get("level") or "clean"
+        badge = (rules.SEVERITY_ZH.get(lv, "") if lv != "clean" else "观察")
+        cls = lv if lv != "clean" else "watch"
+        nrows.append(
             "<tr>"
-            f"<td class='sev {f['level']}'>{rules.SEVERITY_ZH.get(f['level'],'')}</td>"
+            f"<td class='sev {cls}'>{badge}</td>"
             f"<td>{f['score']:.0f}</td>"
             f"<td>{esc(f['regularity'] if f['regularity'] is not None else '不可评估')}</td>"
             f"<td>{esc(f['avg_interval'] if f['avg_interval'] is not None else '—')}</td>"
@@ -1150,24 +1207,57 @@ def export_report(m: Monitor) -> str:
                       "不可用 —— " + esc(net.get("estats_note") or "未启用") +
                       "；本次仅依据连接建立事件判定，长连接型心跳可能漏检")
         net_html = f"""
-<h2>四、网络外联与心跳规律性（观测 {esc(nses.get('duration', 0))} 秒）</h2>
-<div class="meta">采样周期 {esc(net.get('sample_interval'))} 秒 ·
+<h2>四、网络外联与心跳规律性 —— 可疑 {len(b['nets'])} 项 / 规律性观察 {len(b['watch'])} 项</h2>
+<div class="meta">观测 {esc(nses.get('duration', 0))} 秒 ·
+ 采样周期 {esc(net.get('sample_interval'))} 秒 ·
  活动连接 {esc(net.get('live_conns', 0))} 条 ·
  流量条目 {esc(ns.get('flows', 0))} 个 ·
  其中可评估规律性 {esc(ns.get('evaluated', 0))} 个 ·
  规律性 ≥85 的 {esc(ns.get('high_reg', 0))} 个<br>
  字节统计（estats）：{estats_txt}</div>
-<p>判定说明：<b>规律性</b>是纯时序指标（0–100，由事件间隔的变异系数换算），
-回答"这条外联有多像机器在打拍子"；<b>风险</b>是规则判定结果。
-软件更新检查、遥测上报同样具有周期性，因此规律性本身不构成指控 ——
-只有与可疑进程或可疑目标共振时才会升级为告警。</p>
+<p><b>「观察」是什么意思</b>：规律性 ≥55 但没有旁证（进程可信、目标端点也不可疑）的外联，
+只作为时序观察展示，<b>不计入风险等级</b>。软件更新检查、遥测上报同样极其规律，
+只凭"像机器打拍子"就告警会让这一页失去意义。</p>
 <table><tr><th>等级</th><th>风险分</th><th>规律性</th><th>平均周期(s)</th>
 <th>PID</th><th>进程</th><th>远端</th><th>地址归属</th><th>判定依据</th></tr>
-{''.join(net_rows) or '<tr><td colspan="9">未发现规律性异常或可疑的网络外联</td></tr>'}</table>
+{''.join(nrows) or '<tr><td colspan="9">未发现规律性异常或可疑的网络外联</td></tr>'}</table>
 """
     else:
-        net_html = "<h2>四、网络外联与心跳规律性</h2><p>本次未启用网络检测。</p>"
+        net_html = ("<h2>四、网络外联与心跳规律性</h2>"
+                    "<p>本次未启用网络检测。</p>")
 
+    # ---- 五、高危项详情（进程 + 系统痕迹，与上面的计数同源）
+    detail_blocks = []
+    for p in b["procs"]:
+        if p["level"] not in ("critical", "high"):
+            continue
+        items = "".join(
+            f"<li><b>[{f['rule_id']}] {esc(f['title'])}</b>"
+            f"<div class='ev'>{esc(f['evidence'])}</div>"
+            f"<div class='ad'>{esc(f['advice'])}</div></li>"
+            for f in p["findings"])
+        detail_blocks.append(
+            f"<div class='card'><h3>{esc(p['name'])} <span class='pid'>进程 · PID {p['pid']}</span>"
+            f"<span class='sev {p['level']}'>{rules.SEVERITY_ZH.get(p['level'],'')} · {p['score']}分</span></h3>"
+            f"<div class='path'>{esc(p['exe'])}</div>"
+            f"<div class='path'>命令行：{esc(p['cmdline_str'][:300])}</div>"
+            f"<ul>{items}</ul></div>")
+    for a in b["arts"]:
+        if a["level"] not in ("critical", "high"):
+            continue
+        items = "".join(
+            f"<li><b>[{f['rule_id']}] {esc(f['title'])}</b>"
+            f"<div class='ev'>{esc(f['evidence'])}</div>"
+            f"<div class='ad'>{esc(f['advice'])}</div></li>"
+            for f in a["findings"])
+        kind = _KIND_ZH.get(a.get("kind", ""), a.get("kind", ""))
+        detail_blocks.append(
+            f"<div class='card'><h3>{esc(a['title'])} <span class='pid'>系统痕迹 · {esc(kind)}</span>"
+            f"<span class='sev {a['level']}'>{rules.SEVERITY_ZH.get(a['level'],'')} · {a['score']}分</span></h3>"
+            f"<div class='path'>{esc(a.get('subtitle',''))}</div>"
+            f"<ul>{items}</ul></div>")
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>银狐进程排查报告 {ts}</title>
@@ -1188,6 +1278,11 @@ def export_report(m: Monitor) -> str:
  .sev{{font-weight:700;white-space:nowrap}}
  .sev.critical{{color:#ff5c5c}} .sev.high{{color:#ffa53d}}
  .sev.medium{{color:#ffd666}} .sev.low{{color:#63b3ff}}
+ .sev.watch{{color:#7d8fa9}}
+ .tally td,.tally th{{text-align:center}} .tally td:first-child,.tally th:first-child{{text-align:left}}
+ .tally tr.sum td{{border-top:2px solid #2b3d5c;font-weight:700;background:#101a2b}}
+ .note{{color:#7d8fa9;font-size:12.5px;background:#101a2b;border-left:2px solid #2b3d5c;
+   padding:9px 12px;border-radius:6px}}
  .card{{background:#111b2c;border:1px solid #1e2d45;border-radius:10px;
    padding:14px 16px;margin:10px 0}}
  .card ul{{margin:8px 0 0;padding-left:18px}} .card li{{margin-bottom:10px}}
@@ -1205,40 +1300,65 @@ def export_report(m: Monitor) -> str:
 
 <div class="grid">
  <div class="kpi"><b>{s['total']}</b><span>进程总数</span></div>
- <div class="kpi"><b style="color:#ff5c5c">{s['levels']['critical']}</b><span>严重进程</span></div>
- <div class="kpi"><b style="color:#ffa53d">{s['levels']['high']}</b><span>高危进程</span></div>
- <div class="kpi"><b>{s['artifact_findings']}</b><span>系统制品异常</span></div>
+ <div class="kpi"><b>{b['rows']}</b><span>异常项合计</span></div>
+ <div class="kpi"><b style="color:#ff5c5c">{ca['critical']}</b><span>严重项</span></div>
+ <div class="kpi"><b style="color:#ffa53d">{ca['high']}</b><span>高危项</span></div>
  <div class="kpi"><b>{s['connections']}</b><span>网络连接</span></div>
- <div class="kpi"><b>{esc(ns.get('high_reg', 0))}</b><span>高规律性外联</span></div>
+ <div class="kpi"><b>{len(b['watch'])}</b><span>规律性观察项</span></div>
 </div>
 
 <h2>一、结论摘要</h2>
-<p>{'<b style="color:#ff5c5c">发现严重风险项，高度疑似银狐木马活动，请立即处置。</b>'
-   if (s['levels']['critical'] or s['artifact_levels']['critical']
-       or (ns.get('levels') or {}).get('critical'))
-   else ('<b style="color:#ffa53d">存在高危异常项，建议逐条核查。</b>'
-   if (s['levels']['high'] or s['artifact_levels']['high']
-       or (ns.get('levels') or {}).get('high'))
-   else '本轮扫描未发现银狐相关高风险特征。注意：本工具基于行为特征，不能替代杀毒软件全盘扫描。')}</p>
+<p>{concl}</p>
 
-<h2>二、异常进程（按风险分排序）</h2>
+<p><b>本报告共列出 {b['rows']} 项异常</b>（其中需优先处置的严重+高危共
+<b>{b['need_action']}</b> 项），按类别分布如下：</p>
+<table class="tally">
+<tr><th>类别</th><th>严重</th><th>高危</th><th>中危</th><th>低危</th><th>合计</th></tr>
+<tr><td>异常进程</td><td>{cp['critical']}</td><td>{cp['high']}</td>
+    <td>{cp['medium']}</td><td>{cp['low']}</td><td>{len(b['procs'])}</td></tr>
+<tr><td>系统痕迹</td><td>{car['critical']}</td><td>{car['high']}</td>
+    <td>{car['medium']}</td><td>{car['low']}</td><td>{len(b['arts'])}</td></tr>
+<tr><td>网络外联</td><td>{cn['critical']}</td><td>{cn['high']}</td>
+    <td>{cn['medium']}</td><td>{cn['low']}</td><td>{len(b['nets'])}</td></tr>
+<tr class="sum"><td>合计</td><td>{ca['critical']}</td><td>{ca['high']}</td>
+    <td>{ca['medium']}</td><td>{ca['low']}</td><td>{b['rows']}</td></tr>
+</table>
+<p class="note"><b>口径说明</b>：本表数字与下方各表格<b>逐行对应</b> ——
+"异常进程"对应第二节、"系统痕迹"对应第三节、"网络外联"对应第四节。
+三者是<b>三类不同的对象</b>（运行中的进程 / 系统里的持久化与落地痕迹 / 网络连接），
+所以各自的等级计数分开列，不能只看其中一栏就下结论。</p>
+
+<h2>二、异常进程 —— {len(b['procs'])} 项</h2>
 <table><tr><th>等级</th><th>评分</th><th>PID</th><th>名称</th><th>路径</th>
 <th>签名</th><th>命中规则</th></tr>{''.join(rows) or '<tr><td colspan="7">无</td></tr>'}</table>
 
-<h2>三、系统制品异常（计划任务 / 服务 / 驱动 / hosts / 注册表 / 文件）</h2>
+<h2>三、系统痕迹异常 —— {len(b['arts'])} 项</h2>
+<p class="note"><b>「系统痕迹」指什么</b>：木马除了"正在运行的进程"之外，
+还会在系统里留下需要长期存在的东西 —— 计划任务、系统服务、内核驱动、
+hosts 文件改动、注册表启动项与 Defender 排除项、以及磁盘上落地的伪装文件。
+它们的特点是<b>进程被杀掉之后依然存在</b>，所以必须单独查、单独清。
+本工具把这一类统一叫"系统痕迹"（也叫系统制品 / 制品）。</p>
 <table><tr><th>等级</th><th>评分</th><th>类型</th><th>对象</th><th>位置</th>
 <th>命中规则</th></tr>{''.join(arows) or '<tr><td colspan="6">无</td></tr>'}</table>
 
 {net_html}
 
-<h2>五、高危进程详情与处置建议</h2>
-{''.join(detail_blocks) or '<p>无</p>'}
+<h2>五、高危项详情与处置建议 —— {b['need_action']} 项</h2>
+{''.join(detail_blocks) or '<p>无严重 / 高危项。</p>'}
 
 <footer>本报告由「银狐进程监视器」自动生成。检测规则依据 CNCERT/天融信、FreeBuf、火绒安全实验室、
 先知社区等公开技术报告编制；IOC 会随木马迭代失效，请定期更新。<br>
 本工具为行为检测辅助工具，无法覆盖纯内存执行、内核级隐藏等场景，不能替代专业 EDR 与杀毒软件。
 网络章节的规律性判定基于本机连接表与 TCP 统计计数器，<b>不抓包、不解密、不发起任何网络请求</b>。</footer>
 </body></html>"""
+    return html
+
+
+def export_report(m: Monitor) -> str:
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(REPORT_DIR, f"银狐排查报告-{ts}.html")
+    html = build_report_html(m.state())
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
     return path

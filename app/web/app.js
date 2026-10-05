@@ -129,7 +129,7 @@ function render() {
     ['crit', L.critical, '严重风险进程', '疑似银狐本体或注入载体'],
     ['high', L.high, '高危进程', '需人工核查'],
     ['med', L.medium, '中危 / 可疑', '未签名外联、随机命名等'],
-    ['', s.artifact_findings, '系统制品异常', `任务 ${s.tasks} · 服务 ${s.services} · 驱动 ${s.drivers}`],
+    ['', s.artifact_findings, '系统痕迹异常', `任务 ${s.tasks} · 服务 ${s.services} · 驱动 ${s.drivers}`],
     ['ok', s.connections, '网络连接', s.sig_pending > 0 ? `签名待校验 ${s.sig_pending}` : '签名库已就绪'],
   ];
   if (STATE.net) {

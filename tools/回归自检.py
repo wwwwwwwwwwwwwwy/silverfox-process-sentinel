@@ -677,6 +677,113 @@ try:
 except Exception:
     pass
 
+# 12. 排查报告：顶部数字必须与下方表格逐行对应
+#     —— 背景：试用者发现报告顶部写「高危 0」，下面却列出一堆「高危」行。
+#        根因是顶部 KPI 只按"进程"分等级，而表格还列了系统痕迹，两处口径不同。
+#        这里把"数字 == 表格行数"固化成断言，结构上防止再犯。
+print()
+print("=" * 72)
+print("排查报告 —— 顶部计数必须与表格行一致")
+print("=" * 72)
+import server as _srv  # noqa: E402
+
+
+def _mk_f(rid, sev, w):
+    return {"rule_id": rid, "title": f"{rid} 标题", "severity": sev,
+            "severity_zh": rules.SEVERITY_ZH[sev], "weight": w, "category": "process",
+            "evidence": "证据", "advice": "建议"}
+
+
+def _mk_report_state(p_hi=0, p_med=1, a_hi=0, a_crit=0, n_hi=0, n_watch=0):
+    procs, arts, flows = [], [], []
+    for i in range(p_hi):
+        procs.append({"pid": 100 + i, "name": f"p{i}.exe", "exe": "C:\\x.exe",
+                      "level": "high", "score": 70, "cmdline_str": "x",
+                      "findings": [_mk_f("P001", "high", 70)],
+                      "signature": {"kind": "unsigned", "status_zh": "未签名"}})
+    for i in range(p_med):
+        procs.append({"pid": 200 + i, "name": f"m{i}.exe", "exe": "C:\\y.exe",
+                      "level": "medium", "score": 40, "cmdline_str": "y",
+                      "findings": [_mk_f("P006", "medium", 40)],
+                      "signature": {"kind": "unsigned", "status_zh": "未签名"}})
+    for i in range(a_hi):
+        arts.append({"id": f"ah{i}", "kind": "task", "title": f"高危任务{i}",
+                     "subtitle": "sub", "level": "high", "score": 70,
+                     "findings": [_mk_f("T004", "high", 70)]})
+    for i in range(a_crit):
+        arts.append({"id": f"ac{i}", "kind": "service", "title": f"严重服务{i}",
+                     "subtitle": "sub", "level": "critical", "score": 95,
+                     "findings": [_mk_f("S001", "critical", 95)]})
+    for i in range(n_hi):
+        flows.append({"key": f"k{i}", "pid": 10 + i, "name": "net.exe",
+                      "rip": "1.2.3.4", "rport": 443, "ip_scope_zh": "公网",
+                      "level": "high", "score": 70, "regularity": 92,
+                      "avg_interval": 60, "findings": [_mk_f("N001", "high", 70)],
+                      "verdict": "疑似 C2 心跳"})
+    for i in range(n_watch):
+        flows.append({"key": f"w{i}", "pid": 20 + i, "name": "svc.exe",
+                      "rip": "1.2.3.5", "rport": 443, "ip_scope_zh": "公网",
+                      "level": "clean", "score": 0, "regularity": 88,
+                      "avg_interval": 300, "findings": [],
+                      "verdict": "规律性高但上下文无可疑特征"})
+    return {
+        "summary": {"total": len(procs), "connections": 10, "admin": True,
+                    "scan_count": 3},
+        "processes": procs, "artifacts": arts,
+        "net": {"flows": flows, "estats": True, "sample_interval": 1.0,
+                "live_conns": 5,
+                "summary": {"flows": len(flows), "evaluated": len(flows),
+                            "high_reg": n_watch},
+                "session": {"duration": 120}},
+    }
+
+
+def _report_consistency(name, **kw):
+    st = _mk_report_state(**kw)
+    html = _srv.build_report_html(st)
+    n_crit = html.count("<td class='sev critical'>")
+    n_high = html.count("<td class='sev high'>")
+    total_rows = n_crit + n_high + html.count("<td class='sev medium'>") \
+        + html.count("<td class='sev low'>")
+    ok = (f'<b style="color:#ff5c5c">{n_crit}</b><span>严重项</span>' in html
+          and f'<b style="color:#ffa53d">{n_high}</b><span>高危项</span>' in html
+          and f'<b>{total_rows}</b><span>异常项合计</span>' in html)
+    check(f"{name}：顶部计数 == 表格行数（严重 {n_crit} / 高危 {n_high} / 合计 {total_rows}）",
+          ok)
+    return html, n_crit, n_high
+
+
+# 12.1 ⭐ 试用者报的原场景：0 个高危进程，但系统痕迹里有很多高危
+_h1, _c1, _h1n = _report_consistency("0 高危进程 + 3 高危痕迹", p_hi=0, a_hi=3)
+check("★ 原场景：结论必须承认存在高危（而不是说「未发现高风险特征」）",
+      "存在高危异常项" in _h1)
+check("★ 原场景：高危项数字为 3（不是 0）", _h1n == 3, f"实际 {_h1n}")
+check("★ 原场景：系统痕迹表里确实有 3 行高危", _h1.count("<td class='sev high'>") == 3)
+check("★ 原场景：标题写明各类别项数", "异常进程 —— 1 项" in _h1
+      and "系统痕迹异常 —— 3 项" in _h1)
+
+# 12.2 三类对象混合
+_h2, _c2, _h2n = _report_consistency("混合场景", p_hi=2, a_hi=1, a_crit=1, n_hi=1)
+check("混合场景：严重项 == 1（仅系统痕迹里那 1 条）", _c2 == 1, f"实际 {_c2}")
+check("混合场景：高危项 == 4（2 进程 + 1 痕迹 + 1 网络）", _h2n == 4, f"实际 {_h2n}")
+
+# 12.3 「规律性观察」不得被算成风险
+_h3, _c3, _h3n = _report_consistency("只有观察项", p_hi=0, p_med=0, n_watch=4)
+check("规律性观察项不计入风险等级", _c3 == 0 and _h3n == 0)
+check("规律性观察项单独计数并在标题写明", "规律性观察 4 项" in _h3)
+check("观察行标为「观察」而不是「高危」", "<td class='sev watch'>观察</td>" in _h3)
+check("无风险时结论不应声称发现高风险",
+      "未发现银狐相关风险特征" in _h3)
+
+# 12.4 只有中危时，结论不能是"未发现高风险特征"（初版的另一处自相矛盾）
+_h4, _, _ = _report_consistency("只有中危", p_hi=0, p_med=2)
+check("只有中危时结论明确说明是中危", "存在若干中危可疑项" in _h4)
+
+# 12.5 详情章节数量与顶部「需处置」一致
+check("详情章节数量 == 严重+高危合计",
+      f"五、高危项详情与处置建议 —— {_c2 + _h2n} 项" in _h2,
+      f"期望 {_c2 + _h2n}")
+
 print()
 print("=" * 72)
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
