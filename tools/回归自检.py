@@ -878,6 +878,23 @@ check("强信号目录 / 随机目录算强信号上下文",
       rules._in_strong_scan_context(r"C:\Users\Public")
       and rules._in_strong_scan_context(r"C:\ProgramData\bcCfOw"))
 
+# 13.6 ⚠️ 强信号目录必须按**路径段**匹配，不能用子串包含。
+#      实测缺陷：`C:\ProgramData\Vendor\TempData` 含 `\temp` 子串、
+#      `...\Downloads_old` 含 `\downloads` 子串，用子串匹配会被判成
+#      "在 Temp / Downloads 之下"，于是把刚排除掉的资源文件重新放回
+#      F001 的射程 —— 正好抵消了本次要修的误报。已改用段级匹配 in_dirs()。
+check("含 \\Temp 子串的正常目录不算强信号（TempData）",
+      not rules._in_strong_scan_context(r"C:\ProgramData\Vendor\TempData"))
+check("含 \\Downloads 子串的正常目录不算强信号（Downloads_old）",
+      not rules._in_strong_scan_context(r"C:\ProgramData\Vendor\Downloads_old"))
+check("Program Files 下的 TempDir 不算强信号",
+      not rules._in_strong_scan_context(r"C:\Program Files\Foo\TempDir"))
+check("真正的 Temp 目录仍算强信号（段级匹配不能把检出也砍掉）",
+      rules._in_strong_scan_context(r"C:\Windows\Temp")
+      and rules._in_strong_scan_context(r"C:\Users\x\AppData\Local\Temp"))
+check("真正的 Downloads 目录仍算强信号",
+      rules._in_strong_scan_context(r"C:\Users\x\Downloads"))
+
 print()
 print("=" * 72)
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")

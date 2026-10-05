@@ -1318,10 +1318,13 @@ def _in_strong_scan_context(dirpath: str) -> bool:
     真正需要定罪的是"随机目录 / 用户可写目录"里的伪装 PE ——
     正常软件不会把自己的可执行体藏在 `C:\\ProgramData\\aBcDe1\\x.dat`。
     """
-    low = norm(dirpath)
-    for d in iocs.WRITABLE_DIRS_STRONG:
-        if norm(d) in low:
-            return True
+    # ⚠️ 必须按**路径段**匹配（in_dirs），不能用子串包含。
+    #    子串匹配会把 `C:\\ProgramData\\Vendor\\TempData`、`...\\Downloads_old`
+    #    这类正常软件目录也当成「Temp / Downloads 之下」，
+    #    于是把刚刚排除掉的资源文件重新放回 F001 的射程里 ——
+    #    正是本次要修的那类误报。项目里已有段级匹配工具，直接用。
+    if in_dirs(dirpath, iocs.WRITABLE_DIRS_STRONG):
+        return True
     # ⚠️ 这里**不能用 _parts()** —— 它内部走 norm() 会把路径整串小写化，
     #    而 looks_random_dir 恰恰依赖大小写分布，小写化后 bcCfOw → bccfow
     #    会被判成"非随机"（实测踩过）。必须保留原始大小写来切分。
