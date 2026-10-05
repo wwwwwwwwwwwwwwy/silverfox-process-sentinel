@@ -988,7 +988,14 @@ class NetMonitor:
 
     @staticmethod
     def _slim_flow(f: dict) -> dict:
-        """下发给前端轮询用的精简结构（每 2 秒一次，必须小）。"""
+        """下发给前端轮询用的精简结构（每 2 秒一次，必须小）。
+
+        ⚠️ 这里**不带完整的 findings**（那会让 2 秒一次的轮询白白变大），
+        只带 `finding_ids`（规则号，很短）。报告导出时按规则号去查规则名。
+        ⚠️ 正因如此，**任何消费方都不能直接访问 flow['findings']** ——
+        报告就因为这个踩过坑：一旦存在"规律性观察项"或"可疑外联"，
+        导出就会 KeyError('findings') 整个失败（实测）。
+        """
         return {
             "key": f["key"], "pid": f["pid"], "name": f["name"], "exe": f["exe"],
             "proto": f["proto"], "rip": f["rip"], "rport": f["rport"],
@@ -1005,6 +1012,7 @@ class NetMonitor:
             "endpoint_score": f["endpoint_score"],
             "score": f["score"], "level": f["level"], "verdict": f["verdict"],
             "resolution_limited": f["resolution_limited"],
+            "finding_ids": [x.get("rule_id", "") for x in (f.get("findings") or [])],
             "note": f["notes"][0] if f["notes"] else "",
         }
 

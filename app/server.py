@@ -1050,6 +1050,11 @@ _RULE_DOC = [
      "进程行为已判 critical/high，且确实保持着公网连接"),
 ]
 
+# 规则号 → 规则名（报告里还原网络行的判定依据用，见 _flow_rules_text）。
+# ⚠️ 必须在这里（_RULE_DOC 之后）**直接定义**，不能在文件前部先写个空字典占位 ——
+#    那样会被这个赋值顺序覆盖掉，运行时报 NameError / 拿到空表。
+_RULE_TITLE = {rid: title for rid, title, _sev, _desc in _RULE_DOC}
+
 
 def rule_catalog() -> list[dict]:
     return [{"rule_id": r, "title": t, "severity": s,
@@ -1093,6 +1098,8 @@ _KIND_ZH = {
     "hosts": "hosts 文件", "registry": "注册表", "file": "文件特征",
 }
 _LEVELS = ("critical", "high", "medium", "low")
+# 规则号 → 规则名（_RULE_TITLE）在文件后部、_RULE_DOC 之后构建，
+# 报告里网络行只有 finding_ids，靠它还原成可读文字。
 
 
 def _tally(items) -> dict:
@@ -1127,6 +1134,21 @@ def report_buckets(st: dict) -> dict:
         "rows": len(procs) + len(arts) + len(nets),
         "need_action": c_all["critical"] + c_all["high"],
     }
+
+
+def _flow_rules_text(f: dict) -> str:
+    """网络行的「判定依据」文案：优先用规则号 + 规则名，否则退回判决语。
+
+    ⚠️ **绝不能直接访问 `f['findings']`** —— 下发给前端的网络流量是精简结构
+    （`netmon._slim_flow`），里面**没有** findings，只有 `finding_ids`。
+    报告初版直接取了 `f['findings']`，于是只要存在"规律性观察项"或"可疑外联"，
+    导出就会 `KeyError('findings')` 整个失败（实测踩过，用户报的就是这个）。
+    """
+    ids = f.get("finding_ids") or []
+    if ids:
+        return "；".join(
+            (f"[{i}] {_RULE_TITLE[i]}" if _RULE_TITLE.get(i) else f"[{i}]") for i in ids)
+    return f.get("verdict") or ""
 
 
 def build_report_html(st: dict) -> str:
@@ -1201,7 +1223,7 @@ def build_report_html(st: dict) -> str:
             f"<td>{f['pid']}</td><td>{esc(f['name'])}</td>"
             f"<td class='path'>{esc(f['rip'])}:{f['rport']}</td>"
             f"<td>{esc(f['ip_scope_zh'])}</td>"
-            f"<td>{esc('；'.join(x['title'] for x in f['findings']) or f['verdict'])}</td>"
+            f"<td>{esc(_flow_rules_text(f))}</td>"
             "</tr>")
 
     net_html = ""

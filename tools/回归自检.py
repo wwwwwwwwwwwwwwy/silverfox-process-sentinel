@@ -676,6 +676,12 @@ try:
     os.remove(_HELPER)
 except Exception:
     pass
+# ⚠️ 辅助进程的日志也要删 —— 只删 .py 会在仓库/程序目录里留下 _tmp_orphan_helper.py.log
+#    这种垃圾文件（实测把安装目录和仓库都污染了一次）。
+try:
+    os.remove(_HLOG)
+except Exception:
+    pass
 
 # 12. 排查报告：顶部数字必须与下方表格逐行对应
 #     —— 背景：试用者发现报告顶部写「高危 0」，下面却列出一堆「高危」行。
@@ -715,16 +721,20 @@ def _mk_report_state(p_hi=0, p_med=1, a_hi=0, a_crit=0, n_hi=0, n_watch=0):
                      "subtitle": "sub", "level": "critical", "score": 95,
                      "findings": [_mk_f("S001", "critical", 95)]})
     for i in range(n_hi):
+        # ⚠️ 这里必须**照抄 netmon._slim_flow 的真实字段**：只带 finding_ids，
+        #    **不带** findings。夹具里多写一个真实数据没有的字段，
+        #    就会把"报告直接访问 flow['findings'] 导致 KeyError"这类 bug 放过去
+        #    —— 实测就是这么漏掉的（导出在网络页有观察项时整个失败）。
         flows.append({"key": f"k{i}", "pid": 10 + i, "name": "net.exe",
                       "rip": "1.2.3.4", "rport": 443, "ip_scope_zh": "公网",
                       "level": "high", "score": 70, "regularity": 92,
-                      "avg_interval": 60, "findings": [_mk_f("N001", "high", 70)],
+                      "avg_interval": 60, "finding_ids": ["N001"],
                       "verdict": "疑似 C2 心跳"})
     for i in range(n_watch):
         flows.append({"key": f"w{i}", "pid": 20 + i, "name": "svc.exe",
                       "rip": "1.2.3.5", "rport": 443, "ip_scope_zh": "公网",
                       "level": "clean", "score": 0, "regularity": 88,
-                      "avg_interval": 300, "findings": [],
+                      "avg_interval": 300, "finding_ids": [],
                       "verdict": "规律性高但上下文无可疑特征"})
     return {
         "summary": {"total": len(procs), "connections": 10, "admin": True,
@@ -740,7 +750,13 @@ def _mk_report_state(p_hi=0, p_med=1, a_hi=0, a_crit=0, n_hi=0, n_watch=0):
 
 def _report_consistency(name, **kw):
     st = _mk_report_state(**kw)
-    html = _srv.build_report_html(st)
+    try:
+        html = _srv.build_report_html(st)
+        _build_err = ""
+    except Exception as e:
+        check(f"{name}：报告必须能生成（不能抛异常）", False,
+              f"{type(e).__name__}: {e}")
+        return "", 0, 0
     n_crit = html.count("<td class='sev critical'>")
     n_high = html.count("<td class='sev high'>")
     total_rows = n_crit + n_high + html.count("<td class='sev medium'>") \
@@ -748,8 +764,8 @@ def _report_consistency(name, **kw):
     ok = (f'<b style="color:#ff5c5c">{n_crit}</b><span>严重项</span>' in html
           and f'<b style="color:#ffa53d">{n_high}</b><span>高危项</span>' in html
           and f'<b>{total_rows}</b><span>异常项合计</span>' in html)
-    check(f"{name}：顶部计数 == 表格行数（严重 {n_crit} / 高危 {n_high} / 合计 {total_rows}）",
-          ok)
+    check(f"{name}：报告能生成且顶部计数 == 表格行数"
+          f"（严重 {n_crit} / 高危 {n_high} / 合计 {total_rows}）", ok)
     return html, n_crit, n_high
 
 
@@ -802,6 +818,15 @@ check("告警记录里带上了 advice（否则关键提示不会出现在告警
       str(_sink.alerts[0]["rules"][0] if _sink.alerts else None)[:80])
 check("告警记录里带上了父进程信息（排查同类误报的关键线索）",
       _sink.alerts[0].get("ppid") == 111 and _sink.alerts[0].get("parent") == "python.exe")
+
+# 12.7 网络行的「判定依据」必须靠 finding_ids 还原，不能访问 flow['findings']
+#      —— 精简流里没有 findings，直接取会 KeyError，导致报告整个导不出来（实测）
+check("网络行判定依据用 finding_ids 还原",
+      "[N001]" in _srv._flow_rules_text({"finding_ids": ["N001"], "verdict": "x"}))
+check("没有 finding_ids 时退回判决语",
+      _srv._flow_rules_text({"finding_ids": [], "verdict": "未见异常"}) == "未见异常")
+check("真实精简流形状（只有 finding_ids）不会让报告崩",
+      bool(_srv.build_report_html(_mk_report_state(n_hi=1, n_watch=2))))
 
 # ================================================================
 # 13. 目录名判据 —— 品牌名不得被判「随机命名目录」
