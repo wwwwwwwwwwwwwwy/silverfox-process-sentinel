@@ -209,6 +209,59 @@ def looks_random(base: str) -> bool:
     return has_digit and len(base) >= 6
 
 
+def looks_random_dir(name: str) -> bool:
+    """目录名是否为银狐式随机命名 —— 比 looks_random 更严的版本。
+
+    ## 为什么需要这个更严的版本
+
+    looks_random 的「大小写混杂即随机」判据，会把**驼峰式品牌名**整片误判。
+    2026-10-05 在一台测试机（LAPTOP-B23G59QJ）上实测：
+
+        looks_random("MySQL")     = True
+        looks_random("WXWork")    = True
+        looks_random("MasterPDF") = True
+
+    于是四条**纯误报**同时出现：
+
+        S002 服务 MySQL80          → C:\\Program Files\\MySQL\\...        （85 分）
+        S002 服务 WXWorkUpgrader   → C:\\Program Files (x86)\\WXWork\\... （85 分）
+        T004 任务 DocUpdate        → C:\\Program Files (x86)\\MasterPDF\\ （78 分）
+        S002 服务 DocService       → C:\\Program Files (x86)\\MasterPDF\\ （85 分）
+
+    根因不在"随机名判据"本身，而在**调用点缺少签名上下文**：
+    S004 的写法是 `looks_random(base) and sig_k in UNTRUSTED_KINDS`，
+    所以它不会误报；而 T004 / T006 / S002 是**目录级**判断，
+    手上只有一个字符串，拿不到签名，只能靠判据自身兜住。
+
+    ## 收紧方式（只用于"目录名"，不影响进程名 / DLL 名的 looks_random）
+
+      · 含数字的随机名（SXRh6d / VBV4HZ / cgL18U72 / O02PwqGh / Pl6VgrWG）
+        → 沿用原判据，全部照报；
+      · 不含数字的 → 统计**大小写切换次数**，≥3 次才算随机。
+
+    依据：驼峰品牌名的大小写只在"词首"切换（My|SQL、Master|PDF、WX|Work、
+    One|Drive），切换次数 ≤2；而随机名的大小写是散乱交替的
+    （bcCfOw → b-c-C-f-O-w 切换 4 次；XsOewfN → X-s-O-e-w-f-N 切换 4 次）。
+
+    ⚠️ 两个踩过的坑（不要"优化"回去）：
+      1. 不能要求"含元音" —— MySQL 里根本没有 a/e/i/o/u（y 不算），
+         用元音判据会把 MySQL 判成随机名。
+      2. 不能用 `re.findall(r"[A-Z][a-z]*|[a-z]+")` 切分再看"是否出现单字母片段"
+         —— `[a-z]*` 是贪婪的，`bcCfOw` 会被切成 ['bc','Cf','Ow']，
+         单字母特征被吃掉，同样失效。
+
+    实测：对 MySQL / WXWork / MasterPDF / Google / NVIDIA / OneDrive 全部
+    返回 False；对 bcCfOw / XsOewfN 返回 True。
+    """
+    if not looks_random(name):
+        return False
+    if any(c.isdigit() for c in name):
+        return True
+    switches = sum(1 for a, b in zip(name, name[1:])
+                   if a.isalpha() and b.isalpha() and a.isupper() != b.isupper())
+    return switches >= 3
+
+
 def sig_kind(proc: dict) -> str:
     s = proc.get("signature")
     if not s:
@@ -315,12 +368,12 @@ def nonstandard_target(exe: str) -> str:
             continue
         rel = m.group(1)
         first = rel.split("\\")[0]
-        if looks_random(os.path.splitext(first)[0]) or looks_random(os.path.splitext(rel)[0]):
+        if looks_random_dir(os.path.splitext(first)[0]) or looks_random_dir(os.path.splitext(rel)[0]):
             return f"{root}\\{rel}（随机命名）"
 
     for root in iocs.RANDOM_INSTALL_ROOTS:
         m = re.search(re.escape(root) + r"\\([^\\]+)", exe, re.I)
-        if m and looks_random(m.group(1)):
+        if m and looks_random_dir(m.group(1)):
             return f"{root}\\{m.group(1)}\\（随机命名目录）"
     return ""
 
@@ -829,7 +882,13 @@ def rules_tasks(art: dict) -> list[dict]:
             hit = nonstandard_target(e)
             if hit:
                 break
-        if hit and not any(f["rule_id"] in ("T001", "T002", "T003") for f in fs):
+        # ⚠️ 高权限任务交给 T006 报（它更精确），T004 不重复计分。
+        #    实测：同一个任务被 T004(78) + T006(85) 各计一次，
+        #    score = 85 + 0.35*78 = 112 → 截断成 100，把"中等置信度"
+        #    顶成了"严重 100 分"。同一事实只应计一次分。
+        _is_high_priv = t.get("runlevel", "").lower() in ("highest", "highestavailable")
+        if (hit and not _is_high_priv
+                and not any(f["rule_id"] in ("T001", "T002", "T003") for f in fs)):
             fs.append(finding(
                 "T004", "计划任务执行目标位于非常规目录", "high", 78, "task",
                 f"任务「{tname}」执行 {exec_joined}（命中 {hit}）",
@@ -1214,8 +1273,62 @@ _SUSPECT_SCAN_DIRS = [
     os.path.expandvars(r"%PROGRAMDATA%"),
     os.path.expandvars(r"%WINDIR%\Temp"),
     os.path.expandvars(r"%TEMP%"),
-    os.path.expandvars(r"%PROGRAMFILES(X86)%"),
+    # ⚠️ 这里**刻意不包含 %PROGRAMFILES(X86)% 的全量遍历**。
+    #    2026-10-05 实测：把整个 Program Files (x86) 按深度 ≤3 走一遍，
+    #    会把正常软件目录里的资源文件（扩展名是 .dat/.db/.ico/.ini，
+    #    内容其实是 PE）整片报成「伪装扩展名的 PE」——
+    #    测试机上因此凭空出现「共 5 个」的严重项（90 分）。
+    #    银狐在 Program Files (x86) 的落点是**一级随机命名子目录**
+    #    （见 iocs.RANDOM_INSTALL_ROOTS 与 nonstandard_target 的注释），
+    #    所以改为只下钻这些随机命名子目录，见 _pf86_random_subdirs()。
 ]
+
+
+def _pf86_random_subdirs() -> list[str]:
+    """Program Files (x86) 下的**随机命名一级子目录**。
+
+    只扫这些目录，而不是整个 Program Files (x86)：
+    既保留"银狐把载荷丢进随机名目录"的检出能力，
+    又避免把 MySQL / WXWork / MasterPDF 这类正常软件目录里的
+    资源文件当成伪装 PE 批量误报。
+    """
+    root = os.path.expandvars(r"%PROGRAMFILES(X86)%")
+    if not root or not os.path.isdir(root):
+        return []
+    out = []
+    try:
+        for name in os.listdir(root):
+            sub = os.path.join(root, name)
+            if os.path.isdir(sub) and looks_random_dir(name):
+                out.append(sub)
+    except Exception:
+        return out
+    return out
+
+
+def _in_strong_scan_context(dirpath: str) -> bool:
+    """F001 用：当前目录是否处于「强信号」上下文。
+
+    强信号 = ① 路径位于 Public / Temp / Downloads / Recycle.Bin 之下，
+             或 ② 路径中存在**随机命名**的一层目录（银狐落点特征）。
+
+    为什么要加这道闸：`.dat/.db/.ico/.ini` 这类扩展名承载 PE 内容，
+    在正常软件目录里并不罕见（安装缓存、资源打包）。2026-10-05 测试机
+    因此在 Program Files (x86) 整片扫出「共 5 个伪装 PE」（严重 90 分）。
+    真正需要定罪的是"随机目录 / 用户可写目录"里的伪装 PE ——
+    正常软件不会把自己的可执行体藏在 `C:\\ProgramData\\aBcDe1\\x.dat`。
+    """
+    low = norm(dirpath)
+    for d in iocs.WRITABLE_DIRS_STRONG:
+        if norm(d) in low:
+            return True
+    # ⚠️ 这里**不能用 _parts()** —— 它内部走 norm() 会把路径整串小写化，
+    #    而 looks_random_dir 恰恰依赖大小写分布，小写化后 bcCfOw → bccfow
+    #    会被判成"非随机"（实测踩过）。必须保留原始大小写来切分。
+    for part in dirpath.replace("/", "\\").split("\\"):
+        if part and looks_random_dir(part):
+            return True
+    return False
 
 
 def rules_filesystem(art: dict, max_files: int = 4000) -> list[dict]:
@@ -1228,7 +1341,7 @@ def rules_filesystem(art: dict, max_files: int = 4000) -> list[dict]:
     ioc_hits: list[dict] = []
     scanned = 0
 
-    for root_dir in _SUSPECT_SCAN_DIRS:
+    for root_dir in (_SUSPECT_SCAN_DIRS + _pf86_random_subdirs()):
         if not root_dir or not os.path.isdir(root_dir):
             continue
         for dirpath, dirnames, filenames in os.walk(root_dir):
@@ -1255,7 +1368,7 @@ def rules_filesystem(art: dict, max_files: int = 4000) -> list[dict]:
                 if fn.lower() in [x.lower() for x in iocs.MALICIOUS_FILENAMES]:
                     ioc_hits.append({"path": fp, "name": fn})
 
-                if ext in iocs.DISGUISED_EXTENSIONS:
+                if ext in iocs.DISGUISED_EXTENSIONS and _in_strong_scan_context(dirpath):
                     magic = collector.file_magic(fp)
                     if magic == "PE":
                         pe_disguised.append({"path": fp, "ext": ext, "magic": magic})

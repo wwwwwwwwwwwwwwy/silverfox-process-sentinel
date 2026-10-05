@@ -803,6 +803,81 @@ check("告警记录里带上了 advice（否则关键提示不会出现在告警
 check("告警记录里带上了父进程信息（排查同类误报的关键线索）",
       _sink.alerts[0].get("ppid") == 111 and _sink.alerts[0].get("parent") == "python.exe")
 
+# ================================================================
+# 13. 目录名判据 —— 品牌名不得被判「随机命名目录」
+#
+# 2026-10-05 测试机（LAPTOP-B23G59QJ）实测：looks_random 的
+# 「大小写混杂即随机」判据把驼峰式品牌名整片误判 ——
+#   looks_random("MySQL") / ("WXWork") / ("MasterPDF") 全为 True，
+# 于是 MySQL80 服务、WXWorkUpgrader 服务、迅读PDF 的 DocUpdate 任务与
+# DocService 服务，全部因「Program Files 下随机命名目录」被判高危/严重。
+# 这四条是纯误报。修复引入 looks_random_dir（只用于目录名场景），
+# 本节的断言把「品牌名不误报」与「银狐随机名仍检出」两侧一起钉住。
+# ================================================================
+print()
+print("=" * 72)
+print("13. looks_random_dir —— 品牌名 vs 银狐随机目录名")
+print("=" * 72)
+
+for _n in ("MySQL", "WXWork", "MasterPDF", "Google", "NVIDIA", "OneDrive",
+           "Realtek", "PowerPoint", "McAfee"):
+    check(f"品牌名 {_n} 不判为随机目录", not rules.looks_random_dir(_n))
+
+for _n in ("bcCfOw", "SXRh6d", "VBV4HZ", "cgL18U72", "O02PwqGh", "Pl6VgrWG"):
+    check(f"银狐随机名 {_n} 仍判为随机目录", rules.looks_random_dir(_n))
+
+# 13.1 测试机上的四条误报路径必须不再命中
+check("MySQL80 服务路径不再判非常规",
+      not rules.nonstandard_target(
+          r"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe"))
+check("WXWorkUpgrader 服务路径不再判非常规",
+      not rules.nonstandard_target(
+          r"C:\Program Files (x86)\WXWork\WXWorkUpgrader\WXWorkUpgrader.exe"))
+check("迅读PDF DocUpdate 任务路径不再判非常规",
+      not rules.nonstandard_target(r"C:\Program Files (x86)\MasterPDF\DocUpdate.exe"))
+check("迅读PDF DocService 服务路径不再判非常规",
+      not rules.nonstandard_target(r"C:\Program Files (x86)\MasterPDF\DocService.exe"))
+
+# 13.2 强信号目录与随机目录必须仍然命中 ——
+#      不能为了压误报把检出能力一起砍掉
+check("Temp 目录下的可执行文件仍判非常规",
+      bool(rules.nonstandard_target(
+          r"C:\Users\LIN\AppData\Local\Temp\ScreenShareClientUpdate.exe")))
+check("Users\\Public 下的随机名仍判非常规",
+      bool(rules.nonstandard_target(r"C:\Users\Public\bcCfOw.exe")))
+check("Program Files (x86) 下随机目录仍判非常规",
+      bool(rules.nonstandard_target(r"C:\Program Files (x86)\bcCfOw\x.exe")))
+
+# 13.3 端到端：DocUpdate 任务不得再产生任何 T 系列命中
+_t_doc = {"name": "DocUpdate", "path": "\\", "state": "Ready", "hidden": False,
+          "runlevel": "Highest", "userid": "SYSTEM",
+          "actions": [{"exec": r"C:\Program Files (x86)\MasterPDF\DocUpdate.exe"}],
+          "triggers": []}
+_ids_doc = [f["rule_id"] for it in rules.rules_tasks({"tasks": [_t_doc]})
+            for f in it.get("findings", [])]
+check("DocUpdate 任务不再产生任何计划任务类告警", not _ids_doc, f"实际 {_ids_doc}")
+
+# 13.4 但同一形态若落在随机目录，必须仍然报（检出能力不回退）
+_t_evil = {"name": "DocUpdate", "path": "\\", "state": "Ready", "hidden": False,
+           "runlevel": "Highest", "userid": "SYSTEM",
+           "actions": [{"exec": r"C:\Program Files (x86)\bcCfOw\DocUpdate.exe"}],
+           "triggers": []}
+_ids_evil = [f["rule_id"] for it in rules.rules_tasks({"tasks": [_t_evil]})
+             for f in it.get("findings", [])]
+check("同一任务落在随机目录时仍报（T004/T006）",
+      ("T006" in _ids_evil) or ("T004" in _ids_evil), f"实际 {_ids_evil}")
+check("高权限任务只报 T006，不与 T004 重复计分",
+      "T006" in _ids_evil and "T004" not in _ids_evil, f"实际 {_ids_evil}")
+
+# 13.5 F001 上下文闸
+check("正常软件目录不算强信号上下文",
+      not rules._in_strong_scan_context(r"C:\ProgramData\MySQL\MySQL Server 8.0")
+      and not rules._in_strong_scan_context(
+          r"C:\Program Files (x86)\WXWork\WXWorkUpgrader"))
+check("强信号目录 / 随机目录算强信号上下文",
+      rules._in_strong_scan_context(r"C:\Users\Public")
+      and rules._in_strong_scan_context(r"C:\ProgramData\bcCfOw"))
+
 print()
 print("=" * 72)
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
