@@ -25,6 +25,7 @@ from urllib.parse import urlparse, parse_qs
 import collector
 import integrity
 import iocs
+import netmon
 import paths
 import whitelist
 import rules
@@ -103,10 +104,15 @@ INSTANCE_SECRET = _load_instance_secret(WORKSPACE)
 
 
 class Monitor:
-    def __init__(self, proc_interval: float = 3.0, artifact_interval: float = 180.0):
+    def __init__(self, proc_interval: float = 3.0, artifact_interval: float = 180.0,
+                 net_interval: float = netmon.DEFAULT_SAMPLE_INTERVAL,
+                 net_duration: float = netmon.DEFAULT_DURATION,
+                 net_enabled: bool = True):
         self.lock = threading.RLock()
         self.proc_interval = proc_interval
         self.artifact_interval = artifact_interval
+        self.net_enabled = net_enabled
+        self.net_duration = float(net_duration)
 
         self.procs: list[dict] = []
         self.artifacts: dict = {}
@@ -133,6 +139,16 @@ class Monitor:
         self.integrity_interval = 300.0
         self.artifact_whitelisted = 0
 
+        # ---- 网络心跳检测引擎 ----
+        # ⚠️ 锁序约定（防死锁，改动时务必遵守）：
+        #     netmon 线程可能在持 netmon.lock 时通过告警回调去拿 self.lock，
+        #     因此**任何持有 self.lock 的地方都不得再去取 netmon.lock**。
+        #     具体地：state() 先取 netmon 快照再进 self.lock；
+        #     scan_processes() 在释放 self.lock 之后才推送进程索引。
+        self.netmon = netmon.NetMonitor(sample_interval=net_interval) if net_enabled else None
+        if self.netmon is not None:
+            self.netmon.alert_sink = self._net_alert
+
         # 先把已知项文件建出来，再做完整性校验。
         # whitelist.json 位于 app/ 下、被基线覆盖；若首次启动时它还不存在，
         # 校验会报 removed → 界面显示"程序文件已被改动"（实测踩过）。
@@ -145,6 +161,10 @@ class Monitor:
     def start(self):
         threading.Thread(target=self._loop, daemon=True, name="scan-loop").start()
         threading.Thread(target=self._sig_worker, daemon=True, name="sig-worker").start()
+        # 「打开时自动扫描」：启动即开始一轮网络观测，无需用户点任何按钮。
+        if self.netmon is not None:
+            self.netmon.start()
+            self.netmon.start_session(self.net_duration, auto=True)
 
     def _loop(self):
         # 首轮：制品 + 进程 + 完整性
@@ -308,6 +328,10 @@ class Monitor:
             self.scan_ms = int((time.time() - t0) * 1000)
             self.scan_count += 1
             self.status = "运行中"
+        # ⚠️ 必须在锁外推送：netmon.update_proc_index 要拿 netmon.lock，
+        #    在 self.lock 内取它就是反向锁序（见 Monitor.__init__ 的锁序约定）。
+        if self.netmon is not None:
+            self.netmon.update_proc_index({p["pid"]: p for p in procs})
         self._spawn_once("deep", self._deep_scan_cycle)
 
     def scan_artifacts(self):
@@ -482,6 +506,29 @@ class Monitor:
             })
         del self.alerts[200:]
 
+    def _net_alert(self, f: dict):
+        """网络引擎检出高危流量 → 写入告警时间线。
+
+        由 netmon 线程回调，**调用时不得持有 netmon.lock**（见锁序约定）。
+        """
+        top = sorted(f.get("findings") or [], key=lambda x: -x["weight"])[:3]
+        self.alerts.insert(0, {
+            "time": time.strftime("%H:%M:%S"),
+            "ts": time.time(),
+            "level": f["level"],
+            "score": f["score"],
+            "name": f"{f['name']} → {f['rip']}:{f['rport']}",
+            "pid": f["pid"],
+            "exe": f.get("exe", ""),
+            "net_key": f["key"],
+            "net": True,
+            "rules": [{"id": x["rule_id"], "title": x["title"],
+                       "severity": x["severity"], "evidence": x["evidence"]}
+                      for x in top],
+            "text": f"[网络] {f['verdict']} · " + "；".join(x["title"] for x in top[:2]),
+        })
+        del self.alerts[200:]
+
     # ------------------------------------------------------------ 签名线程
     def _sig_worker(self):
         while self.running:
@@ -515,6 +562,8 @@ class Monitor:
 
     # ------------------------------------------------------------ 状态输出
     def state(self) -> dict:
+        # 先取网络快照再进 self.lock —— 锁序要求，不能反过来（见 __init__ 的约定）。
+        net = self.netmon.snapshot() if self.netmon is not None else None
         with self.lock:
             levels = {"critical": 0, "high": 0, "medium": 0, "low": 0, "clean": 0}
             for p in self.procs:
@@ -565,10 +614,14 @@ class Monitor:
                     "ioc_version": iocs.IOC_VERSION,
                     "ioc_sources": iocs.IOC_SOURCES,
                     "rule_count": len(_RULE_DOC),
+                    "net_enabled": self.netmon is not None,
+                    "net_estats": bool(net and net.get("estats")),
+                    "net_sample_interval": (net or {}).get("sample_interval"),
                 },
                                 # 已知项随 state 一起下发：前端 poll() 会整体替换 STATE，
                 # 单独 fetch 挂在 STATE 上的字段会被下一轮冲掉（实测踩过）。
                 "whitelist": whitelist.listing(),
+                "net": net,
 "processes": self.procs,
                 "artifacts": af,
                 "alerts": self.alerts[:100],
@@ -739,6 +792,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(ioc_catalog())
         elif p == "/api/whitelist":
             self._json(whitelist.listing())
+        elif p == "/api/net/flow":
+            if m.netmon is None:
+                self._json({"error": "网络检测未启用"})
+            else:
+                key = q.get("key", [""])[0]
+                if not netmon.parse_flow_key(key):
+                    self._json({"error": "非法的流量标识"}, 400)
+                else:
+                    self._json(m.netmon.flow_detail(key))
         elif p == "/api/ping":
             # 供启动时探测"是否已有实例在运行"，避免重复双击开出多个监视器。
             # 加固：携带实例密钥，启动器只认带正确密钥的响应（见 main.find_running_instance）。
@@ -871,6 +933,28 @@ class Handler(BaseHTTPRequestHandler):
             # 加固：延迟 0.3s 再关停，保证响应送达（初版立即 shutdown，
             # 实测客户端收到连接重置而不是响应）
             threading.Timer(0.3, self.server.shutdown).start()
+        elif p in ("/api/net/start", "/api/net/duration", "/api/net/stop"):
+            if m.netmon is None:
+                self._json({"ok": False, "msg": "网络检测未启用（启动时用了 --no-net）"})
+                return
+            try:
+                dur = float(body.get("duration") or netmon.DEFAULT_DURATION)
+            except Exception:
+                dur = float(netmon.DEFAULT_DURATION)
+            if p == "/api/net/start":
+                m.netmon.start_session(dur)
+                self._json({"ok": True, "msg": f"已开始一轮 {netmon.fmt_duration(dur)} 的网络观测"})
+            elif p == "/api/net/duration":
+                r = m.netmon.set_duration(dur)
+                if r.get("finalized"):
+                    msg = f"观测时长已改为 {netmon.fmt_duration(dur)}，已到时间，本轮结算完成"
+                elif r.get("restarted"):
+                    msg = f"已按 {netmon.fmt_duration(dur)} 重新开始一轮观测"
+                else:
+                    msg = f"观测时长已改为 {netmon.fmt_duration(dur)}"
+                self._json({"ok": True, "msg": msg, **r})
+            else:
+                self._json(m.netmon.stop_session())
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
@@ -937,6 +1021,16 @@ _RULE_DOC = [
     ("X001", "加载银狐 IOC 模块", "critical", "内存模块命中"),
     ("X002", "加载伪装扩展名的可执行模块", "critical", "内存中 PE 伪装"),
     ("X003", "疑似白加黑侧加载", "high", "进程目录下的未签名 DLL"),
+    ("N001", "外联呈现周期性心跳", "high",
+     "连接建立或数据突发的间隔高度规律（低抖动）—— C2 心跳的典型时间特征"),
+    ("N002", "连接已知银狐 C2 地址（网络会话层）", "critical",
+     "会话期间实测到与公开披露 C2 的活动连接"),
+    ("N003", "规律性外联 + 进程本身已判高风险", "critical",
+     "网络规律性与进程行为两条独立证据同时指向同一目标"),
+    ("N004", "未签名程序连接银狐常用非标端口", "high",
+     "会话期间实测到未签名进程连向 18300 / 7000 / 8001 等端口"),
+    ("N005", "高风险进程持有对外连接", "high",
+     "进程行为已判 critical/high，且确实保持着公网连接"),
 ]
 
 
@@ -1016,6 +1110,51 @@ def export_report(m: Monitor) -> str:
             f"<div class='path'>命令行：{esc(p['cmdline_str'][:300])}</div>"
             f"<ul>{items}</ul></div>")
 
+    # ---- 网络心跳检测章节 ----
+    net = st.get("net") or {}
+    ns = net.get("summary") or {}
+    nses = net.get("session") or {}
+    net_rows = []
+    for f in (net.get("flows") or []):
+        if f["level"] == "clean" and (f.get("regularity") or 0) < 55:
+            continue
+        net_rows.append(
+            "<tr>"
+            f"<td class='sev {f['level']}'>{rules.SEVERITY_ZH.get(f['level'],'')}</td>"
+            f"<td>{f['score']:.0f}</td>"
+            f"<td>{esc(f['regularity'] if f['regularity'] is not None else '不可评估')}</td>"
+            f"<td>{esc(f['avg_interval'] if f['avg_interval'] is not None else '—')}</td>"
+            f"<td>{f['pid']}</td><td>{esc(f['name'])}</td>"
+            f"<td class='path'>{esc(f['rip'])}:{f['rport']}</td>"
+            f"<td>{esc(f['ip_scope_zh'])}</td>"
+            f"<td>{esc('；'.join(x['title'] for x in f['findings']) or f['verdict'])}</td>"
+            "</tr>")
+
+    net_html = ""
+    if net:
+        estats_txt = ("可用 —— 已启用每连接字节统计，可识别长连接上的周期性数据心跳"
+                      if net.get("estats") else
+                      "不可用 —— " + esc(net.get("estats_note") or "未启用") +
+                      "；本次仅依据连接建立事件判定，长连接型心跳可能漏检")
+        net_html = f"""
+<h2>四、网络外联与心跳规律性（观测 {esc(nses.get('duration', 0))} 秒）</h2>
+<div class="meta">采样周期 {esc(net.get('sample_interval'))} 秒 ·
+ 活动连接 {esc(net.get('live_conns', 0))} 条 ·
+ 流量条目 {esc(ns.get('flows', 0))} 个 ·
+ 其中可评估规律性 {esc(ns.get('evaluated', 0))} 个 ·
+ 规律性 ≥85 的 {esc(ns.get('high_reg', 0))} 个<br>
+ 字节统计（estats）：{estats_txt}</div>
+<p>判定说明：<b>规律性</b>是纯时序指标（0–100，由事件间隔的变异系数换算），
+回答"这条外联有多像机器在打拍子"；<b>风险</b>是规则判定结果。
+软件更新检查、遥测上报同样具有周期性，因此规律性本身不构成指控 ——
+只有与可疑进程或可疑目标共振时才会升级为告警。</p>
+<table><tr><th>等级</th><th>风险分</th><th>规律性</th><th>平均周期(s)</th>
+<th>PID</th><th>进程</th><th>远端</th><th>地址归属</th><th>判定依据</th></tr>
+{''.join(net_rows) or '<tr><td colspan="9">未发现规律性异常或可疑的网络外联</td></tr>'}</table>
+"""
+    else:
+        net_html = "<h2>四、网络外联与心跳规律性</h2><p>本次未启用网络检测。</p>"
+
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>银狐进程排查报告 {ts}</title>
@@ -1057,13 +1196,16 @@ def export_report(m: Monitor) -> str:
  <div class="kpi"><b style="color:#ffa53d">{s['levels']['high']}</b><span>高危进程</span></div>
  <div class="kpi"><b>{s['artifact_findings']}</b><span>系统制品异常</span></div>
  <div class="kpi"><b>{s['connections']}</b><span>网络连接</span></div>
+ <div class="kpi"><b>{esc(ns.get('high_reg', 0))}</b><span>高规律性外联</span></div>
 </div>
 
 <h2>一、结论摘要</h2>
 <p>{'<b style="color:#ff5c5c">发现严重风险项，高度疑似银狐木马活动，请立即处置。</b>'
-   if (s['levels']['critical'] or s['artifact_levels']['critical'])
+   if (s['levels']['critical'] or s['artifact_levels']['critical']
+       or (ns.get('levels') or {}).get('critical'))
    else ('<b style="color:#ffa53d">存在高危异常项，建议逐条核查。</b>'
-   if (s['levels']['high'] or s['artifact_levels']['high'])
+   if (s['levels']['high'] or s['artifact_levels']['high']
+       or (ns.get('levels') or {}).get('high'))
    else '本轮扫描未发现银狐相关高风险特征。注意：本工具基于行为特征，不能替代杀毒软件全盘扫描。')}</p>
 
 <h2>二、异常进程（按风险分排序）</h2>
@@ -1074,12 +1216,15 @@ def export_report(m: Monitor) -> str:
 <table><tr><th>等级</th><th>评分</th><th>类型</th><th>对象</th><th>位置</th>
 <th>命中规则</th></tr>{''.join(arows) or '<tr><td colspan="6">无</td></tr>'}</table>
 
-<h2>四、高危进程详情与处置建议</h2>
+{net_html}
+
+<h2>五、高危进程详情与处置建议</h2>
 {''.join(detail_blocks) or '<p>无</p>'}
 
 <footer>本报告由「银狐进程监视器」自动生成。检测规则依据 CNCERT/天融信、FreeBuf、火绒安全实验室、
 先知社区等公开技术报告编制；IOC 会随木马迭代失效，请定期更新。<br>
-本工具为行为检测辅助工具，无法覆盖纯内存执行、内核级隐藏等场景，不能替代专业 EDR 与杀毒软件。</footer>
+本工具为行为检测辅助工具，无法覆盖纯内存执行、内核级隐藏等场景，不能替代专业 EDR 与杀毒软件。
+网络章节的规律性判定基于本机连接表与 TCP 统计计数器，<b>不抓包、不解密、不发起任何网络请求</b>。</footer>
 </body></html>"""
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -1091,8 +1236,13 @@ def export_report(m: Monitor) -> str:
 # ================================================================
 
 def serve(host: str = "127.0.0.1", port: int = 8787,
-          proc_interval: float = 3.0, artifact_interval: float = 180.0) -> ThreadingHTTPServer:
-    m = Monitor(proc_interval=proc_interval, artifact_interval=artifact_interval)
+          proc_interval: float = 3.0, artifact_interval: float = 180.0,
+          net_interval: float = netmon.DEFAULT_SAMPLE_INTERVAL,
+          net_duration: float = netmon.DEFAULT_DURATION,
+          net_enabled: bool = True) -> ThreadingHTTPServer:
+    m = Monitor(proc_interval=proc_interval, artifact_interval=artifact_interval,
+                net_interval=net_interval, net_duration=net_duration,
+                net_enabled=net_enabled)
     m.bind_addr = f"{host}:{port}"
     m.start()
     Handler.monitor = m

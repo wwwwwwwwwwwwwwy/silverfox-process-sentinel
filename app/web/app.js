@@ -122,14 +122,24 @@ function render() {
   $('#pillUptime').innerHTML = `<span>运行 ${fmtUptime(s.uptime)}</span>`;
 
   /* KPI */
-  $('#kpis').innerHTML = [
+  const netSum = (STATE.net || {}).summary || {};
+  const netLv = netSum.levels || {};
+  const kpi = [
     ['', s.total, '进程总数', `扫描耗时 ${s.scan_ms} ms · 第 ${s.scan_count} 轮`],
     ['crit', L.critical, '严重风险进程', '疑似银狐本体或注入载体'],
     ['high', L.high, '高危进程', '需人工核查'],
     ['med', L.medium, '中危 / 可疑', '未签名外联、随机命名等'],
     ['', s.artifact_findings, '系统制品异常', `任务 ${s.tasks} · 服务 ${s.services} · 驱动 ${s.drivers}`],
     ['ok', s.connections, '网络连接', s.sig_pending > 0 ? `签名待校验 ${s.sig_pending}` : '签名库已就绪'],
-  ].map(([cls, v, label, sub]) => `
+  ];
+  if (STATE.net) {
+    const regN = (netSum.high_reg || 0) + (netSum.regular || 0) - (netSum.high_reg || 0);
+    const badN = (netLv.critical || 0) + (netLv.high || 0);
+    kpi.push([badN > 0 ? 'crit' : (regN > 0 ? 'med' : 'ok'), netSum.high_reg || 0,
+      '高规律性外联',
+      badN > 0 ? `其中 ${badN} 个已判可疑` : `规律性 ≥70 共 ${regN} 个`]);
+  }
+  $('#kpis').innerHTML = kpi.map(([cls, v, label, sub]) => `
     <div class="kpi ${cls}">
       <b>${esc(v)}</b><span>${esc(label)}</span><i>${esc(sub)}</i>
     </div>`).join('');
@@ -142,8 +152,16 @@ function render() {
   $('#tabArtCount').className = s.artifact_levels.critical > 0 ? 'crit'
     : (s.artifact_levels.high > 0 ? 'high' : '');
   $('#tabAlertCount').textContent = STATE.alerts.length;
+  if (STATE.net) {
+    const focusN = (STATE.net.flows || []).filter(netIsFocus).length;
+    const netBad = (netLv.critical || 0) + (netLv.high || 0);
+    $('#tabNetCount').textContent = focusN;
+    $('#tabNetCount').className = netBad > 0 ? 'crit'
+      : ((netSum.high_reg || 0) > 0 ? 'high' : '');
+  }
 
   renderProcTable();
+  renderNet();
   renderArtifacts();
   renderAlerts();
   renderSecurity();
@@ -209,6 +227,422 @@ function renderProcTable() {
        没有符合条件的进程</td></tr>`;
 }
 
+/* ============================================================
+   网络监控 —— 心跳规律性
+   ------------------------------------------------------------
+   界面上刻意把「规律性」与「风险」做成两个独立维度：
+     · 规律性 = 纯时序指标（事件间隔的变异系数换算），回答"有多像机器在打拍子"；
+     · 风险   = 规则判定结果。
+   软件更新检查、遥测上报同样很规律，所以规律性高不等于恶意 ——
+   把两者分开显示，用户既能看到"最规律的外联是哪些"，又不会被假告警淹没。
+   ============================================================ */
+const NET = {
+  filter: 'focus',
+  q: '',
+  onlyBytes: false,
+  sort: { key: 'score', dir: -1 },
+  touched: false,
+  ticksFor: '',
+  timer: null,
+};
+
+const C = {
+  crit: '#ff5c5c', high: '#ffa53d', med: '#ffd666', low: '#63b3ff',
+  ok: '#3fb950', accent: '#60a5fa', dim: '#5d6f88', cyan: '#22d3ee', gold: '#ffc53d',
+};
+
+function regClass(reg) {
+  if (reg == null) return 'none';
+  if (reg >= 85) return 'r85';
+  if (reg >= 70) return 'r70';
+  if (reg >= 55) return 'r55';
+  return 'r0';
+}
+function regText(reg) { return reg == null ? '—' : String(Math.round(reg)); }
+
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(2) + ' GB';
+}
+function fmtPeriod(sec) {
+  if (sec == null) return '—';
+  sec = Number(sec);
+  if (sec < 90) return sec.toFixed(1) + ' 秒';
+  if (sec < 3600) return (sec / 60).toFixed(1) + ' 分钟';
+  return (sec / 3600).toFixed(1) + ' 小时';
+}
+function durLabel(sec) {
+  sec = Number(sec) || 0;
+  if (sec < 60) return sec + ' 秒';
+  return (sec / 60) + ' 分钟';
+}
+function durHint(sec) {
+  const p = Math.max(2, Math.round((Number(sec) || 0) / 4));
+  return `最长可识别约 ${p} 秒周期的心跳（需 ≥3 个完整间隔）`;
+}
+function clockOf(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+
+/** 事件直方图：心跳在图上表现为等间距尖峰，是最直观的证据 */
+function bucketSvg(arr, color) {
+  const n = arr.length || 1;
+  const max = Math.max(1, ...arr);
+  const w = 620, h = 78, bw = w / n;
+  let bars = '';
+  for (let i = 0; i < n; i++) {
+    if (!arr[i]) continue;
+    const bh = Math.max(2, (arr[i] / max) * (h - 6));
+    bars += `<rect x="${(i * bw).toFixed(2)}" y="${(h - bh).toFixed(2)}"`
+      + ` width="${Math.max(1, bw - 1.4).toFixed(2)}" height="${bh.toFixed(2)}"`
+      + ` rx="1" fill="${color}"/>`;
+  }
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>`;
+}
+
+/** 间隔序列图：虚线是平均值，柱子越齐 → 规律性越高 */
+function intervalSvg(vals, mean) {
+  const n = vals.length || 1;
+  const max = Math.max(0.001, ...vals, Number(mean) || 0);
+  const w = 620, h = 96, pad = 20;
+  const bw = (w - 4) / n;
+  let bars = '';
+  vals.forEach((v, i) => {
+    const bh = (v / max) * (h - pad - 8);
+    bars += `<rect x="${(2 + i * bw).toFixed(2)}" y="${(h - pad - bh).toFixed(2)}"`
+      + ` width="${Math.max(1, bw - 1.8).toFixed(2)}" height="${bh.toFixed(2)}"`
+      + ` rx="1" fill="${C.accent}" opacity=".85"/>`;
+  });
+  const my = h - pad - ((Number(mean) || 0) / max) * (h - pad - 8);
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    ${bars}
+    <line x1="2" y1="${my.toFixed(2)}" x2="${w - 2}" y2="${my.toFixed(2)}"
+      stroke="${C.med}" stroke-width="1.2" stroke-dasharray="5 4"/>
+    <text x="${w - 3}" y="${Math.max(11, my - 4).toFixed(2)}" text-anchor="end"
+      fill="${C.med}" font-size="11">平均 ${esc(fmtPeriod(mean))}</text>
+  </svg>`;
+}
+
+function netIsFocus(f) {
+  return (f.regularity != null && f.regularity >= 55) || f.score >= 30;
+}
+
+function renderNet() {
+  const net = STATE && STATE.net;
+  const pane = $('#pane-net');
+  if (!net) {
+    $('#netBody').innerHTML = '';
+    $('#netEmpty').classList.add('show');
+    $('#netEmptyWhy').textContent = '本次启动未启用网络检测（使用了 --no-net 参数）。';
+    $('#netProgMeta').textContent = '网络检测未启用';
+    return;
+  }
+  renderNetControl(net);
+  renderNetTable(net);
+  renderNetNotes(net);
+}
+
+function renderNetControl(net) {
+  const stops = net.duration_stops || [30, 60, 120, 180, 300, 600, 900];
+  const sl = $('#netSlider');
+  const ses = net.session || {};
+
+  const key = stops.join(',');
+  if (NET.ticksFor !== key) {
+    NET.ticksFor = key;
+    sl.max = String(stops.length - 1);
+    $('#netTicks').innerHTML = stops.map((s, i) =>
+      `<span data-i="${i}">${esc(durLabel(s))}</span>`).join('');
+  }
+
+  if (!NET.touched) {
+    const want = ses.duration || net.default_duration || stops[2];
+    let idx = 0, best = Infinity;
+    stops.forEach((v, i) => { const dd = Math.abs(v - want); if (dd < best) { best = dd; idx = i; } });
+    sl.value = String(idx);
+    $('#netDurVal').textContent = durLabel(stops[idx]);
+    $('#netDurHint').textContent = durHint(stops[idx]);
+  }
+  // 轨道填充 + 当前档位高亮（跟随滑块实际位置，用户拖动时也即时更新）
+  const idxNow = Number(sl.value) || 0;
+  sl.style.setProperty('--fill', (stops.length > 1 ? (idxNow / (stops.length - 1)) * 100 : 0) + '%');
+  $$('#netTicks span').forEach((sp, i) => sp.classList.toggle('on', i === idxNow));
+
+  const p = Math.round((ses.progress || 0) * 100);
+  $('#netBar').style.width = p + '%';
+  $('#netBar').className = ses.phase === 'done' ? 'done' : '';
+
+  const st = net.summary || {};
+  const lv = st.levels || {};
+  const phaseTxt = ses.phase === 'collecting'
+    ? `<b class="live">采集中</b>` : `<b class="fin">本轮已完成</b>`;
+  $('#netProgMeta').innerHTML =
+    `${phaseTxt} · 已观测 ${clockOf(ses.elapsed)} / ${clockOf(ses.duration)}` +
+    `（${p}%） · 活动连接 ${net.live_conns} 条 · 流量条目 ${st.flows || 0} 个 · ` +
+    `可评估规律性 ${st.evaluated || 0} 个` +
+    (st.high_reg ? ` · <b class="hl">规律性 ≥85 的 ${st.high_reg} 个</b>` : '') +
+    ((lv.critical || lv.high) ? ` · <b class="hl">可疑 ${(lv.critical || 0) + (lv.high || 0)} 个</b>` : '') +
+    ` · 采样 ${net.sample_interval} 秒/次（${net.sample_ms} ms）` +
+    ` · 字节统计 ${net.estats ? '可用' : '不可用'}`;
+
+  $('#netStart').disabled = false;
+  $('#netStop').disabled = ses.phase !== 'collecting';
+}
+
+function renderNetTable(net) {
+  let list = (net.flows || []).slice();
+
+  if (NET.filter === 'focus') list = list.filter(netIsFocus);
+  else if (NET.filter === 'regular') list = list.filter((f) => f.regularity != null && f.regularity >= 70);
+  else if (NET.filter === 'risky') list = list.filter((f) => f.score >= 30);
+  if (NET.onlyBytes) list = list.filter((f) => (f.bytes_out + f.bytes_in) > 0);
+
+  const q = NET.q.trim().toLowerCase();
+  if (q) {
+    list = list.filter((f) =>
+      (f.name || '').toLowerCase().includes(q) ||
+      (f.exe || '').toLowerCase().includes(q) ||
+      (f.rip || '').toLowerCase().includes(q) ||
+      String(f.rport).includes(q) ||
+      String(f.pid).includes(q));
+  }
+
+  const k = NET.sort.key, d = NET.sort.dir;
+  list.sort((a, b) => {
+    let va, vb;
+    if (k === 'regularity') { va = a.regularity == null ? -1 : a.regularity; vb = b.regularity == null ? -1 : b.regularity; }
+    else if (k === 'name') { va = (a.name || '').toLowerCase(); vb = (b.name || '').toLowerCase(); }
+    else if (k === 'rip') { va = (a.rip || '') + ':' + a.rport; vb = (b.rip || '') + ':' + b.rport; }
+    else if (k === 'bytes') { va = a.bytes_out + a.bytes_in; vb = b.bytes_out + b.bytes_in; }
+    else if (k === 'events') { va = a.conn_events + a.byte_events; vb = b.conn_events + b.byte_events; }
+    else { va = a.score; vb = b.score; }
+    if (va < vb) return -1 * d;
+    if (va > vb) return 1 * d;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+
+  $('#netInfo').textContent = `${list.length} / ${(net.flows || []).length} 项`;
+  $('#netEmpty').classList.toggle('show', list.length === 0);
+  if (!list.length) {
+    $('#netEmptyWhy').textContent = (net.flows || []).length
+      ? '当前筛选条件下没有匹配项 —— 试试切到「全部」。'
+      : '观测期间未捕获到任何外联流量。';
+  }
+
+  $('#netBody').innerHTML = list.map((f) => {
+    const rc = regClass(f.regularity);
+    const chips = (f.findings || []).slice(0, 3).map((x) =>
+      `<span class="hit ${x.severity}" title="${esc(x.evidence)}">${esc(x.title)}</span>`).join('');
+    const tags = [
+      `<span class="tag">${esc(f.ip_scope_zh)}</span>`,
+      `<span class="tag">${esc((f.proto || '').toUpperCase())}</span>`,
+    ];
+    if (f.ioc_ip) tags.push('<span class="tag bad">命中 IOC</span>');
+    if (f.port_class === 'silverfox') tags.push('<span class="tag bad">银狐端口</span>');
+    if (f.proc_untrusted) tags.push('<span class="tag warn">进程未签名</span>');
+    if (f.resolution_limited) tags.push('<span class="tag dim">精度受限</span>');
+
+    const sub = [];
+    if (f.regularity_source) sub.push(esc(f.regularity_source));
+    if (f.avg_interval != null) sub.push(`周期 ${esc(fmtPeriod(f.avg_interval))}`);
+    if (f.jitter_pct != null) sub.push(`抖动 ${esc(String(f.jitter_pct))}%`);
+
+    return `<tr class="${f.level} netrow${f.regularity != null && f.regularity >= 85 ? ' reg-hi' : ''}"
+        data-nkey="${esc(f.key)}">
+      <td><span class="badge ${f.level}">${LEVEL_ZH[f.level]}</span>
+          <span class="score ${f.level}">${Math.round(f.score)}</span></td>
+      <td>
+        <div class="regcell ${rc}">
+          <div class="regbar"><i style="width:${f.regularity == null ? 0 : f.regularity}%"></i></div>
+          <span class="regnum">${regText(f.regularity)}</span>
+        </div>
+        <div class="regsub">${sub.join(' · ') || (f.note ? esc(f.note) : '样本不足')}</div>
+      </td>
+      <td><span class="cname">${esc(f.name)}<small>PID ${f.pid} · ${esc(f.signature_zh)}</small></span></td>
+      <td>
+        <div class="remote mono">${esc(f.rip)}:${f.rport}</div>
+        <div class="rsub">${tags.join('')}</div>
+      </td>
+      <td>
+        <div class="mono bytes">↑${esc(fmtBytes(f.bytes_out))} ↓${esc(fmtBytes(f.bytes_in))}</div>
+        <div class="rsub">连接 ${f.live_conns} 条 · 建立事件 ${f.conn_events} · 数据事件 ${f.byte_events}</div>
+      </td>
+      <td>
+        <div class="hits">${chips || '<span class="hit none">未命中规则</span>'}</div>
+        <div class="verdict">${esc(f.verdict)}</div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function renderNetNotes(net) {
+  const hist = (net.history || [])[0];
+  const notes = [];
+  notes.push(`<b>判定方法</b>：<b>规律性</b>由事件间隔的变异系数换算（0–100，越大越像机器打拍子）；`
+    + `<b>风险</b>由规则判定。软件更新检查、遥测上报同样具有周期性，`
+    + `因此规律性高<b>不等于</b>恶意 —— 只有与可疑进程或可疑目标共振时才会升级为告警。`);
+  notes.push(`<b>两条证据流</b>：① 连接建立间隔 —— 覆盖"连上→发数据→断开→再连"型心跳；`
+    + `② 数据突发间隔 —— 覆盖<b>长连接上的心跳</b>（靠 TCP 每连接字节计数器识别，`
+    + `不抓包、不解密）。`);
+  if (!net.estats) {
+    notes.push(`<span class="warn">⚠ 字节统计不可用</span>：${esc(net.estats_note || '')}。`
+      + `本次仅依据连接建立事件判定，<b>长连接型心跳可能漏检</b>；建议以管理员身份运行。`);
+  }
+  if (hist) {
+    notes.push(`<b>上一轮</b>：${esc(hist.started_at)} 起观测 ${esc(durLabel(hist.duration))}，`
+      + `流量条目 ${hist.flows} 个，规律性 ≥70 的 ${hist.regular} 个，`
+      + `严重 ${hist.critical} / 高危 ${hist.high}。`);
+  }
+  notes.push(`<b>观测边界</b>：采样周期 ${net.sample_interval} 秒 —— 短于该周期的行为会混叠；`
+    + `只读本机连接表与 TCP 统计计数器，<b>不发起任何网络请求</b>（无 DNS 解析）；`
+    + `UDP 无远端信息，不参与规律性判定。`);
+  $('#netNotes').innerHTML = notes.map((n) => `<div class="netnote">${n}</div>`).join('');
+}
+
+/* ---------------------------- 网络详情 ---------------------------- */
+async function openNetDetail(key) {
+  $('#drawer').classList.add('show');
+  $('#mask').classList.add('show');
+  $('#dName').textContent = '加载中…';
+  $('#dSub').textContent = '';
+  $('#dBody').innerHTML = '<div style="color:var(--dim);padding:22px 0">正在读取网络流量详情…</div>';
+  let d;
+  try {
+    d = await fetch('/api/net/flow?key=' + encodeURIComponent(key)).then((r) => r.json());
+  } catch (e) {
+    $('#dBody').innerHTML = '<div style="color:var(--crit)">读取失败</div>';
+    return;
+  }
+  if (d.error) {
+    $('#dName').textContent = d.error;
+    $('#dBody').innerHTML = '';
+    return;
+  }
+  renderNetDetail(d);
+}
+
+function renderNetDetail(d) {
+  $('#dName').textContent = `${d.name} → ${d.rip}:${d.rport}`;
+  $('#dSub').textContent = d.exe || `PID ${d.pid}`;
+
+  const rc = regClass(d.regularity);
+  const findHtml = (d.findings || []).map((f) => `
+    <div class="dfind ${f.severity}">
+      <div class="ft"><span class="badge ${f.severity}">${f.severity_zh}</span>
+        [${esc(f.rule_id)}] ${esc(f.title)}</div>
+      <div class="ev">${esc(f.evidence)}</div>
+      ${f.advice ? `<div class="ad">${esc(f.advice)}</div>` : ''}
+    </div>`).join('') || '<div style="color:var(--ok);font-size:12.5px">未命中任何网络规则</div>';
+
+  const cs = d.conn_series, bs = d.byte_series, bk = d.buckets;
+  const connBlock = cs
+    ? `<div class="dsec"><h4>连接建立间隔（${cs.n} 个间隔，来自 ${cs.events} 次连接建立）</h4>
+        ${intervalSvg(cs.intervals, cs.mean)}
+        <div class="kvline">平均 ${esc(fmtPeriod(cs.mean))} · 中位 ${esc(fmtPeriod(cs.median))} ·
+          抖动 ${esc(String(cs.jitter_pct))}% · 变异系数 ${esc(String(cs.cv))} ·
+          极差 ${esc(fmtPeriod(cs.min))} ~ ${esc(fmtPeriod(cs.max))} ·
+          规律性 <b>${esc(String(cs.regularity))}</b></div>
+       </div>`
+    : `<div class="dsec"><h4>连接建立间隔</h4>
+        <div class="kvline dim">观测到的连接建立次数不足，无法给出间隔统计。</div></div>`;
+
+  const byteBlock = bs
+    ? `<div class="dsec"><h4>数据突发间隔（${bs.n} 个间隔，来自 ${bs.events} 次数据突发）</h4>
+        ${intervalSvg(bs.intervals, bs.mean)}
+        <div class="kvline">平均 ${esc(fmtPeriod(bs.mean))} · 抖动 ${esc(String(bs.jitter_pct))}% ·
+          变异系数 ${esc(String(bs.cv))} · 规律性 <b>${esc(String(bs.regularity))}</b></div>
+        ${d.byte_amounts && d.byte_amounts.length ? `
+        <div class="kvline">每次突发的字节量（前 24 次）：
+          <span class="mono">${d.byte_amounts.slice(0, 24).map((x) => esc(fmtBytes(x))).join('、')}</span></div>` : ''}
+       </div>`
+    : `<div class="dsec"><h4>数据突发间隔</h4>
+        <div class="kvline dim">${d.byte_events ? '数据事件过少，样本不足以判断周期。'
+          : '该连接期间没有观测到数据传输（或字节统计不可用）。'}</div></div>`;
+
+  const bucketBlock = bk ? `
+    <div class="dsec">
+      <h4>周期性直方图（每格 ${esc(String(bk.width))} 秒）</h4>
+      <div class="sparklabel">数据字节量</div>
+      ${bucketSvg(bk.bytes, C.accent)}
+      <div class="sparklabel">连接建立次数</div>
+      ${bucketSvg(bk.conns, C.cyan)}
+      <div class="kvline dim">心跳在图上表现为<b>等间距的尖峰</b>；
+        若尖峰间距均匀、高度相近，说明周期性明显。</div>
+    </div>` : '';
+
+  const noteHtml = (d.notes || []).length
+    ? `<div class="dsec"><h4>观测说明</h4>${d.notes.map((n) => `<div class="kvline">· ${esc(n)}</div>`).join('')}</div>`
+    : '';
+
+  $('#dBody').innerHTML = `
+    <div class="dsec">
+      <div class="netverdict ${d.level}">
+        <div class="nvscore">${Math.round(d.score)}<small>风险分</small></div>
+        <div class="nvreg ${rc}">
+          <div class="nvnum">${regText(d.regularity)}<small>规律性</small></div>
+        </div>
+        <div class="nvtext">
+          <b>${esc(LEVEL_ZH[d.level])} · ${esc(d.verdict)}</b>
+          <div class="kvline">${d.regularity_source ? '证据来源：' + esc(d.regularity_source) : '无可评估的时序证据'}
+            ${d.avg_interval != null ? ' · 平均周期 ' + esc(fmtPeriod(d.avg_interval)) : ''}
+            ${d.jitter_pct != null ? ' · 抖动 ' + esc(String(d.jitter_pct)) + '%' : ''}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="dsec"><h4>命中规则（${(d.findings || []).length}）</h4>${findHtml}</div>
+
+    ${bucketBlock}
+    ${connBlock}
+    ${byteBlock}
+
+    <div class="dsec">
+      <h4>远端端点</h4>
+      <dl class="kv">
+        <dt>地址</dt><dd class="mono">${esc(d.rip)}:${d.rport}</dd>
+        <dt>地址归属</dt><dd>${esc(d.ip_scope_zh)}</dd>
+        <dt>端口分类</dt><dd>${esc(d.port_class === 'silverfox' ? '银狐公开报告点名的 C2 端口段'
+          : d.port_class === 'abused' ? '常被远控滥用的端口'
+          : d.port_class === 'common' ? '常见服务端口' : '非标准端口')}</dd>
+        <dt>命中 C2 清单</dt><dd>${d.ioc_ip ? '<span style="color:var(--crit)">是</span>' : '否'}</dd>
+        <dt>端点风险</dt><dd>${Math.round(d.endpoint_score)} 分
+          ${(d.endpoint_why || []).length ? '<br><span class="dim">' + d.endpoint_why.map(esc).join('；') + '</span>' : ''}</dd>
+      </dl>
+    </div>
+
+    <div class="dsec">
+      <h4>本机进程</h4>
+      <dl class="kv">
+        <dt>进程 / PID</dt><dd>${esc(d.name)} / ${d.pid}</dd>
+        <dt>路径</dt><dd class="mono">${esc(d.exe || '—')}</dd>
+        <dt>数字签名</dt><dd>${esc(d.signature_zh)}</dd>
+        <dt>进程风险</dt><dd>${esc(LEVEL_ZH[d.proc_level] || d.proc_level)} · ${Math.round(d.proc_score)} 分
+          ${d.proc_untrusted ? '<span style="color:var(--high)">（签名不可信）</span>' : ''}</dd>
+        <dt>UDP 端口</dt><dd class="mono">${(d.udp_ports || []).join('、') || '—'}</dd>
+      </dl>
+    </div>
+
+    <div class="dsec">
+      <h4>观测统计</h4>
+      <dl class="kv">
+        <dt>连接实例数</dt><dd>${d.instances} 个（当前存活 ${d.live_conns} 条）</dd>
+        <dt>计数重置次数</dt><dd>${d.resets} 次${d.resets ? '<span class="dim">（四元组被新连接复用，属正常）</span>' : ''}</dd>
+        <dt>累计流量</dt><dd>↑ ${esc(fmtBytes(d.bytes_out))}　↓ ${esc(fmtBytes(d.bytes_in))}</dd>
+        <dt>静默比例</dt><dd>${Math.round((d.idle_ratio || 0) * 100)}%
+          <span class="dim">（心跳型应为高静默 + 离散突发）</span></dd>
+        <dt>样本置信度</dt><dd>${Math.round((d.regularity_confidence || 0) * 100)}%
+          ${d.resolution_limited ? '<span style="color:var(--high)">· 间隔接近采样精度，可靠性下降</span>' : ''}</dd>
+      </dl>
+    </div>
+
+    ${noteHtml}`;
+}
+
 /* ---------------------------- 系统制品 */
 function renderArtifacts() {
   if (!STATE) return;
@@ -247,12 +681,14 @@ function renderAlerts() {
     const rules = (a.rules || []).map((r) => `
       <div class="alarm-rule">[${esc(r.id)}] ${esc(r.title)}
         <div class="ev">${esc(r.evidence)}</div></div>`).join('');
-    return `<div class="alertitem ${a.level}">
+    return `<div class="alertitem ${a.level}${a.net ? ' netalert' : ''}"
+        ${a.net_key ? `data-nkey="${esc(a.net_key)}"` : ''}>
       <div class="alarm-head">
         <time>${esc(a.time)}</time>
         <span class="badge ${a.level}">${LEVEL_ZH[a.level]}</span>
         <b>${esc(a.name)}</b>
         ${a.pid ? `<span class="mono" style="color:var(--dim)">PID ${a.pid}</span>` : ''}
+        ${a.net ? '<span class="nettag">网络</span>' : ''}
       </div>
       ${a.exe ? `<div class="artsub">${esc(a.exe)}</div>` : ''}
       <div class="alarm-rules">${rules}</div>
@@ -632,6 +1068,86 @@ document.addEventListener('DOMContentLoaded', () => {
     ART_FILTER = b.dataset.kind;
     renderArtifacts();
   }));
+
+  /* ---------- 网络监控：时长滑块 ---------- */
+  // 拖动时先本地更新显示（不卡顿），停手 550ms 后才提交 —— 否则每移动一格
+  // 就打一次接口，既浪费又会让会话被反复重开。
+  $('#netSlider').addEventListener('input', (e) => {
+    NET.touched = true;
+    const stops = (STATE.net && STATE.net.duration_stops) || [30, 60, 120, 180, 300, 600, 900];
+    const i = Number(e.target.value) || 0;
+    const d = stops[i] || 120;
+    $('#netDurVal').textContent = durLabel(d);
+    $('#netDurHint').textContent = durHint(d);
+    e.target.style.setProperty('--fill',
+      (stops.length > 1 ? (i / (stops.length - 1)) * 100 : 0) + '%');
+    $$('#netTicks span').forEach((sp, k) => sp.classList.toggle('on', k === i));
+    clearTimeout(NET.timer);
+    NET.timer = setTimeout(async () => {
+      const r = await api('/api/net/duration', { duration: d });
+      if (r.msg) toast(r.msg, r.ok ? 'ok' : 'err');
+      poll();
+    }, 550);
+  });
+
+  $('#netStart').addEventListener('click', async () => {
+    const stops = (STATE.net && STATE.net.duration_stops) || [30, 60, 120, 180, 300, 600, 900];
+    const d = stops[Number($('#netSlider').value)] || 120;
+    const r = await api('/api/net/start', { duration: d });
+    toast(r.msg || '已开始', r.ok ? 'ok' : 'err');
+    poll();
+  });
+
+  $('#netStop').addEventListener('click', async () => {
+    const r = await api('/api/net/stop');
+    toast(r.msg || '已停止', r.ok ? 'ok' : 'err');
+    poll();
+  });
+
+  $$('#segNet button').forEach((b) => b.addEventListener('click', () => {
+    $$('#segNet button').forEach((x) => x.classList.remove('on'));
+    b.classList.add('on');
+    NET.filter = b.dataset.nf;
+    renderNet();
+  }));
+
+  $('#netQ').addEventListener('input', (e) => { NET.q = e.target.value; renderNetTable(STATE.net); });
+  $('#chkNetBytes').addEventListener('change', (e) => {
+    NET.onlyBytes = e.target.checked; renderNetTable(STATE.net);
+  });
+
+  $$('#netTable thead th').forEach((th) => th.addEventListener('click', () => {
+    const k = th.dataset.nsort;
+    if (!k) return;
+    if (NET.sort.key === k) NET.sort.dir *= -1;
+    else { NET.sort.key = k; NET.sort.dir = -1; }
+    renderNetTable(STATE.net);
+  }));
+
+  $('#netBody').addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-nkey]');
+    if (tr) openNetDetail(tr.dataset.nkey);
+  });
+
+  $('#netTicks').addEventListener('click', (e) => {
+    const sp = e.target.closest('span[data-i]');
+    if (!sp) return;
+    const sl = $('#netSlider');
+    sl.value = sp.dataset.i;
+    sl.dispatchEvent(new Event('input'));
+  });
+
+  // 告警时间线里点网络告警 → 直接打开对应流量详情
+  $('#alertList').addEventListener('click', (e) => {
+    const it = e.target.closest('.alertitem');
+    if (!it) return;
+    const k = it.dataset.nkey;
+    if (k) { $$('.tab').forEach((x) => x.classList.remove('active'));
+      $$('.tabpane').forEach((x) => x.classList.remove('active'));
+      $('.tab[data-tab="net"]').classList.add('active');
+      $('#pane-net').classList.add('active');
+      openNetDetail(k); }
+  });
 
   $$('table.grid thead th').forEach((th) => th.addEventListener('click', () => {
     const k = th.dataset.sort;

@@ -130,6 +130,13 @@ def main():
     ap.add_argument("--artifact-interval", type=float, default=180.0, metavar="秒",
                     help="系统制品（计划任务/服务/驱动/启动项/Defender 排除项）扫描间隔，"
                          "默认 180 秒。这类东西变化很慢，调小意义不大且明显增加磁盘读")
+    ap.add_argument("--net-interval", type=float, default=1.0, metavar="秒",
+                    help="网络连接采样周期，默认 1 秒。这是「心跳规律性」检测的时间分辨率："
+                         "调大会漏掉短周期心跳，调小会增加 CPU 占用（实测 1 秒约 1–2 ms/轮）")
+    ap.add_argument("--net-duration", type=float, default=120.0, metavar="秒",
+                    help="打开程序时自动开始的网络观测时长，默认 120 秒（界面滑块可随时调整）")
+    ap.add_argument("--no-net", action="store_true",
+                    help="关闭网络心跳检测（只做进程/制品检测）")
     args = ap.parse_args()
 
     if args.verify_only:
@@ -179,7 +186,10 @@ def main():
 
     srv, monitor = server.serve(args.host, port,
                                   proc_interval=max(0.5, args.proc_interval),
-                                  artifact_interval=max(10.0, args.artifact_interval))
+                                  artifact_interval=max(10.0, args.artifact_interval),
+                                  net_interval=max(0.4, args.net_interval),
+                                  net_duration=max(5.0, args.net_duration),
+                                  net_enabled=not args.no_net)
     url = f"http://{args.host}:{port}/"
 
     # 记录端口与会话令牌，供「停止监视器.bat」定位本实例并携带凭据
@@ -207,6 +217,14 @@ def main():
     print(f"  扫描节奏 : 进程每 {args.proc_interval:g} 秒 / "
           f"系统制品每 {args.artifact_interval:g} 秒（可用 --proc-interval、"
           f"--artifact-interval 调整）")
+    if args.no_net:
+        print("  网络检测 : 已关闭（--no-net）")
+    else:
+        print(f"  网络检测 : 每 {args.net_interval:g} 秒采样一次，"
+              f"打开即自动观测 {args.net_duration:g} 秒（界面滑块可调）")
+        print(f"             字节统计（estats）: "
+              f"{'可用' if __import__('netapi').available() else '不可用'}"
+              f"（{'需管理员权限' if not __import__('winapi').is_admin() else '已具备权限'}）")
     print("=" * 62)
 
     if args.no_window:

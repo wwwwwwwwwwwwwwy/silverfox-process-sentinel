@@ -40,6 +40,7 @@
 
   <nav class="tabs">
     <button class="tab active" data-tab="proc">进程监控 <em id="tabProcCount"></em></button>
+    <button class="tab" data-tab="net">网络监控 <em id="tabNetCount"></em></button>
     <button class="tab" data-tab="art">系统制品 <em id="tabArtCount"></em></button>
     <button class="tab" data-tab="alert">告警时间线 <em id="tabAlertCount"></em></button>
     <button class="tab" data-tab="rules">规则与 IOC</button>
@@ -75,6 +76,68 @@
         <tbody id="procBody"></tbody>
       </table>
     </div>
+  </section>
+
+  <!-- ===================== 网络监控 ===================== -->
+  <section class="panel tabpane" id="pane-net">
+    <div class="netctl">
+      <div class="netctl-main">
+        <div class="netctl-head">
+          <span class="netctl-label">观测时长</span>
+          <span class="netctl-val" id="netDurVal">—</span>
+          <span class="netctl-hint" id="netDurHint"></span>
+        </div>
+        <div class="slider-wrap">
+          <input type="range" id="netSlider" min="0" max="6" step="1" value="2"
+                 aria-label="观测时长" autocomplete="off">
+          <div class="slider-ticks" id="netTicks"></div>
+        </div>
+      </div>
+      <div class="netctl-acts">
+        <button class="btn primary" id="netStart">重新检测</button>
+        <button class="btn" id="netStop">停止</button>
+      </div>
+    </div>
+
+    <div class="netprog">
+      <div class="netbar"><i id="netBar"></i></div>
+      <div class="netprog-meta" id="netProgMeta"></div>
+    </div>
+
+    <div class="toolbar">
+      <div class="seg" id="segNet">
+        <button data-nf="focus" class="on">重点关注</button>
+        <button data-nf="regular">仅高规律</button>
+        <button data-nf="risky">仅可疑</button>
+        <button data-nf="all">全部</button>
+      </div>
+      <input type="search" id="netQ" placeholder="搜索进程 / 远端 IP / 端口…" autocomplete="off">
+      <label class="chk"><input type="checkbox" id="chkNetBytes"> 仅看有数据传输</label>
+      <span class="toolbar-info" id="netInfo"></span>
+    </div>
+
+    <div class="tablewrap">
+      <table class="grid netgrid" id="netTable">
+        <thead>
+          <tr>
+            <th class="c-risk" data-nsort="score">风险</th>
+            <th class="c-reg" data-nsort="regularity">规律性</th>
+            <th class="c-name" data-nsort="name">进程</th>
+            <th class="c-remote" data-nsort="rip">远端地址</th>
+            <th class="c-bytes" data-nsort="bytes">流量 / 事件</th>
+            <th class="c-verdict">判定依据</th>
+          </tr>
+        </thead>
+        <tbody id="netBody"></tbody>
+      </table>
+    </div>
+
+    <div class="art-empty" id="netEmpty">
+      <b>本时段未发现规律性异常的网络外联</b>
+      <p id="netEmptyWhy"></p>
+    </div>
+
+    <div class="netnotes" id="netNotes"></div>
   </section>
 
   <!-- ===================== 系统制品 ===================== -->

@@ -383,3 +383,158 @@ table.grid td{padding:7px 10px;vertical-align:middle;overflow:hidden}
   border:1px solid var(--border);color:var(--dim)}
 .guardtag.ok{color:var(--ok);border-color:rgba(80,200,120,.4)}
 .guardtag.bad{color:var(--high);border-color:rgba(240,180,60,.5)}
+
+/* ============================================================
+   网络监控 —— 心跳规律性
+   ============================================================ */
+
+/* ---- 控制区：时长滑块 ---- */
+.netctl{
+  display:flex;align-items:flex-end;gap:20px;padding:14px 16px;margin-bottom:11px;
+  background:linear-gradient(180deg,var(--panel-2),var(--panel));
+  border:1px solid var(--border);border-radius:10px;
+}
+.netctl-main{flex:1;min-width:0}
+.netctl-head{display:flex;align-items:baseline;gap:10px;margin-bottom:7px;flex-wrap:wrap}
+.netctl-label{font-size:12px;color:var(--muted);letter-spacing:.4px}
+.netctl-val{font-size:17px;font-weight:600;color:var(--accent-2);font-family:var(--mono)}
+.netctl-hint{font-size:11px;color:var(--dim)}
+.netctl-acts{display:flex;gap:8px;flex-shrink:0}
+
+.slider-wrap{position:relative;padding-bottom:20px}
+.slider-wrap input[type=range]{
+  -webkit-appearance:none;appearance:none;width:100%;height:20px;
+  background:transparent;cursor:pointer;margin:0;display:block;
+}
+.slider-wrap input[type=range]::-webkit-slider-runnable-track{
+  height:6px;border-radius:3px;
+  background:linear-gradient(90deg,var(--accent) var(--fill,0%),#1b2b45 var(--fill,0%));
+  border:1px solid var(--border);
+}
+.slider-wrap input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;width:17px;height:17px;border-radius:50%;margin-top:-6.5px;
+  background:radial-gradient(circle at 35% 30%,#e8f2ff,#3b82f6);
+  border:2px solid #0b1220;
+  box-shadow:0 0 0 1px var(--accent),0 0 12px rgba(59,130,246,.55);
+}
+.slider-wrap input[type=range]:focus{outline:none}
+.slider-wrap input[type=range]:focus::-webkit-slider-thumb{
+  box-shadow:0 0 0 1px var(--accent-2),0 0 16px rgba(96,165,250,.8);
+}
+.slider-ticks{
+  position:absolute;left:0;right:0;bottom:0;display:flex;justify-content:space-between;
+}
+.slider-ticks span{
+  font-size:10px;color:var(--dim);cursor:pointer;white-space:nowrap;
+  padding:0 2px;border-radius:4px;transition:.12s;
+}
+.slider-ticks span:hover{color:var(--accent-2);background:rgba(59,130,246,.1)}
+.slider-ticks span.on{color:var(--accent-2);font-weight:600}
+
+/* ---- 进度条 ---- */
+.netprog{margin-bottom:11px}
+.netbar{height:5px;border-radius:3px;background:#111c2e;border:1px solid var(--border);overflow:hidden}
+.netbar i{
+  display:block;height:100%;width:0;border-radius:3px;transition:width .35s linear;
+  background:linear-gradient(90deg,#1d4ed8,#60a5fa,#22d3ee);
+  box-shadow:0 0 10px rgba(96,165,250,.5);
+}
+.netbar i.done{background:linear-gradient(90deg,#166534,#3fb950)}
+.netprog-meta{font-size:11.5px;color:var(--muted);margin-top:6px;font-family:var(--mono)}
+.netprog-meta .live{color:var(--accent-2)}
+.netprog-meta .fin{color:var(--ok)}
+.netprog-meta .hl{color:var(--med)}
+
+/* ---- 表格 ---- */
+table.netgrid thead th.c-risk{width:88px}
+table.netgrid thead th.c-reg{width:150px}
+table.netgrid thead th.c-name{width:190px}
+table.netgrid thead th.c-remote{width:176px}
+table.netgrid thead th.c-bytes{width:170px}
+table.netgrid tbody tr.medium{background:rgba(255,214,102,.04)}
+table.netgrid tbody tr.medium:hover{background:rgba(255,214,102,.09)}
+table.netgrid tbody tr.low{background:rgba(99,179,255,.035)}
+table.netgrid tbody tr.low:hover{background:rgba(99,179,255,.085)}
+/* 规律性极高的行左侧加一条金色指示条 —— 这就是"高亮规律程度较高的进程" */
+table.netgrid tbody tr.reg-hi{box-shadow:inset 3px 0 0 0 var(--med)}
+table.netgrid tbody tr.reg-hi.critical{box-shadow:inset 3px 0 0 0 var(--crit)}
+table.netgrid tbody tr.reg-hi.high{box-shadow:inset 3px 0 0 0 var(--high)}
+
+.regcell{display:flex;align-items:center;gap:7px}
+.regbar{
+  flex:1;height:7px;border-radius:4px;background:#111c2e;
+  border:1px solid var(--border);overflow:hidden;min-width:44px;
+}
+.regbar i{display:block;height:100%;border-radius:3px;background:var(--dim);transition:width .3s}
+.regcell.r85 .regbar i{background:linear-gradient(90deg,#b45309,var(--gold));box-shadow:0 0 8px rgba(255,197,61,.55)}
+.regcell.r70 .regbar i{background:linear-gradient(90deg,#0e7490,var(--cyan))}
+.regcell.r55 .regbar i{background:linear-gradient(90deg,#1d4ed8,var(--accent))}
+.regcell.none .regbar{border-style:dashed}
+.regcell.none .regbar i{display:none}
+.regnum{font-family:var(--mono);font-size:13px;font-weight:700;min-width:30px;text-align:right}
+.regcell.r85 .regnum{color:var(--gold)}
+.regcell.r70 .regnum{color:var(--cyan)}
+.regcell.r55 .regnum{color:var(--accent-2)}
+.regcell.r0 .regnum{color:var(--dim)}
+.regcell.none .regnum{color:var(--dim);font-size:11px;font-weight:400}
+.regsub{font-size:10.5px;color:var(--dim);margin-top:3px}
+
+.remote{font-size:12px;color:var(--text)}
+.rsub{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.tag{
+  font-size:10px;padding:1px 6px;border-radius:4px;color:var(--muted);
+  background:rgba(59,130,246,.09);border:1px solid var(--border);
+}
+.tag.bad{color:#ff8080;background:rgba(255,92,92,.13);border-color:rgba(255,92,92,.34)}
+.tag.warn{color:#ffbe70;background:rgba(255,165,61,.12);border-color:rgba(255,165,61,.3)}
+.tag.dim{color:var(--dim)}
+.bytes{font-size:11.5px;color:var(--text-2)}
+.hit.none{background:transparent;border-color:transparent;color:var(--dim)}
+.verdict{font-size:11px;color:var(--muted);margin-top:4px}
+
+/* ---- 说明区 ---- */
+.netnotes{margin-top:14px;display:flex;flex-direction:column;gap:7px}
+.netnote{
+  font-size:11.5px;color:var(--muted);line-height:1.65;
+  padding:9px 12px;border-radius:8px;
+  background:rgba(19,31,51,.55);border-left:2px solid var(--border-2);
+}
+.netnote b{color:var(--text-2)}
+.netnote .warn{color:var(--high)}
+
+/* ---- 详情抽屉：结论卡与图表 ---- */
+.netverdict{
+  display:flex;align-items:center;gap:16px;padding:14px 16px;border-radius:10px;
+  background:linear-gradient(135deg,rgba(19,31,51,.95),rgba(13,22,38,.95));
+  border:1px solid var(--border-2);
+}
+.netverdict.critical{border-color:rgba(255,92,92,.45);background:linear-gradient(135deg,rgba(70,20,20,.5),rgba(13,22,38,.95))}
+.netverdict.high{border-color:rgba(255,165,61,.42);background:linear-gradient(135deg,rgba(66,42,12,.42),rgba(13,22,38,.95))}
+.nvscore{font-size:30px;font-weight:700;font-family:var(--mono);line-height:1;color:var(--dim)}
+.netverdict.critical .nvscore{color:var(--crit)}
+.netverdict.high .nvscore{color:var(--high)}
+.netverdict.medium .nvscore{color:var(--med)}
+.netverdict.low .nvscore{color:var(--low)}
+.nvscore small,.nvnum small{display:block;font-size:10px;font-weight:400;color:var(--dim);margin-top:3px}
+.nvreg{padding:0 14px;border-left:1px solid var(--border);border-right:1px solid var(--border)}
+.nvnum{font-size:24px;font-weight:700;font-family:var(--mono);line-height:1;color:var(--dim)}
+.nvreg.r85 .nvnum{color:var(--gold)}
+.nvreg.r70 .nvnum{color:var(--cyan)}
+.nvreg.r55 .nvnum{color:var(--accent-2)}
+.nvtext{flex:1;min-width:0;font-size:12.5px}
+.nvtext b{color:var(--text)}
+
+.spark{width:100%;height:78px;display:block;background:#0a1220;
+  border:1px solid var(--border);border-radius:7px;margin:5px 0}
+.sparklabel{font-size:10.5px;color:var(--dim);margin-top:6px}
+.kvline{font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.6}
+.kvline.dim{color:var(--dim)}
+.kvline b{color:var(--text-2)}
+
+/* ---- 告警时间线：网络告警 ---- */
+.alertitem.netalert{border-left:3px solid var(--cyan)}
+.alertitem.netalert:hover{background:rgba(34,211,238,.06)}
+.nettag{
+  font-size:10px;padding:1px 6px;border-radius:4px;
+  color:var(--cyan);background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.32);
+}

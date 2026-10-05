@@ -2,12 +2,6 @@
 """
 规则回归自检 —— 防止「修一个漏洞、引入一个误报」这类回归
 
-这些断言全部来自实际踩过的坑。安全工具最大的风险不是"查不出"，
-而是"乱报"：一次误报就足以让用户不再相信任何告警。
-
-无需运行监视器，直接对规则函数喂合成样本，秒级跑完。
-
-
 背景：本版本为了修 A1（伪造 windows\\system32 子目录绕过 P001），
 把目录匹配从「子串包含」改成了「前缀锚定」。改动本身是对的，
 但 **漏改了 explorer.exe 的例外值** —— 例外表里写的是相对片段 `\\Windows`，
@@ -25,7 +19,6 @@ import io
 import os
 import sys
 
-# 本脚本不写死任何绝对路径：从自身位置推导出仓库根目录下的 app/
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _common  # noqa: E402
 
@@ -146,6 +139,7 @@ seg = src[src.find("def read_hosts"):src.find("def read_hosts") + 1200]
 check("hosts 支持一行写多个主机名", "parts[1:]" in seg or "for h in" in seg)
 
 # P014 覆盖多种杀安全软件写法
+import rules as _r  # noqa: E402
 src_rules = open(os.path.join(_common.app_dir(), "rules.py"), encoding="utf-8").read()
 check("P014 覆盖 taskkill / Stop-Process / sc stop",
       "stop-process" in src_rules.lower() and "sc\\s+(stop" in src_rules)
@@ -293,6 +287,211 @@ else:
 check("空 exe 不会退化成 None",
       all((p.get("signature") or {}).get("kind") == "noimage"
           for p in _procs if not p.get("exe")))
+
+# 10. 网络心跳规律性（netmon / netapi）
+#     —— 这一块的核心风险不是"检不出"，而是"把系统自身的遥测刷成高危"，
+#        所以正向用例与反向用例必须成对出现。
+print()
+print("=" * 72)
+print("网络心跳规律性 —— 算法、门控与误报边界")
+print("=" * 72)
+import random  # noqa: E402
+import netmon  # noqa: E402
+import netapi  # noqa: E402
+
+_rng = random.Random(20261005)
+
+
+def _series(n, interval, cv):
+    out, t = [], 0.0
+    for _ in range(n):
+        out.append(t)
+        t += max(0.2, interval * (1 + _rng.gauss(0, cv)))
+    return out
+
+
+# --- 10.1 规律性曲线单调且尺度合理
+_prev = 101.0
+for _cv, _lo, _hi in ((0.0, 98, 100), (0.05, 86, 98), (0.10, 66, 82),
+                      (0.20, 30, 48), (0.40, 5, 22)):
+    _st = netmon.analyze_intervals(_series(25, 60.0, _cv), 1.6)
+    _reg = _st["regularity"] if _st else None
+    check(f"CV={_cv} 的规律性落在 [{_lo},{_hi}]",
+          _reg is not None and _lo <= _reg <= _hi, f"实际 {_reg}")
+    if _reg is not None:
+        check(f"CV={_cv} 规律性单调不增", _reg <= _prev, f"{_reg} <= {_prev}")
+        _prev = _reg
+
+# --- 10.2 样本不足必须返回 None（不给假精度）
+for _n in (1, 2, 3):
+    check(f"{_n} 次事件 → 拒绝给出规律性结论",
+          netmon.analyze_intervals(_series(_n, 60.0, 0.0), 1.6) is None)
+
+# --- 10.3 事件合并：一次心跳的「先发后收」不能算成两个事件
+_raw = []
+for _k in range(6):
+    _raw += [_k * 60.0, _k * 60.0 + 1.0]
+_st = netmon.analyze_intervals(_raw, 1.6)
+check("先发后收被合并为 6 次事件", _st and _st["events"] == 6,
+      f"{_st['events'] if _st else '-'}")
+check("合并后周期仍为 60 秒", _st and 59 <= _st["mean"] <= 61,
+      f"{_st['mean'] if _st else '-'}")
+
+# --- 10.4 浏览器式不规则流量不得被判为高规律
+_browser = [0.0]
+_t = 0.0
+for _ in range(40):
+    _t += _rng.choice([0.2, 0.3, 0.8, 1.5, 4.0, 12.0, 35.0, 90.0])
+    _browser.append(_t)
+_st = netmon.analyze_intervals(_browser, 1.6)
+check("浏览器式流量规律性 < 40", _st and _st["regularity"] < 40,
+      f"{_st['regularity'] if _st else '-'}")
+
+# --- 10.5 地址归属
+for _ip, _exp in (("8.218.106.149", "public"), ("10.0.0.5", "private"),
+                  ("100.64.3.7", "cgnat"), ("127.0.0.1", "loopback"),
+                  ("::ffff:127.0.0.1", "loopback"), ("169.254.1.1", "linklocal"),
+                  ("0.0.0.0", "unspecified"), ("fe80::1", "linklocal"),
+                  ("", "unknown")):
+    check(f"ip_scope({_ip!r}) == {_exp}", netmon.ip_scope(_ip) == _exp,
+          f"实际 {netmon.ip_scope(_ip)}")
+
+# --- 10.6 端点风险
+for _ip, _pt, _lo, _hi in (("8.218.106.149", 443, 100, 100),
+                           ("1.2.3.4", 18300, 55, 100),
+                           ("1.2.3.4", 45678, 15, 40),
+                           ("1.2.3.4", 443, 0, 15),
+                           ("10.0.0.5", 443, 0, 1)):
+    _s, _ = netmon.endpoint_risk(_ip, _pt)
+    check(f"端点风险 {_ip}:{_pt} 落在 [{_lo},{_hi}]", _lo <= _s <= _hi, f"实际 {_s}")
+
+# --- 10.7 端到端：把合成流量喂进真正的分析函数
+_NM = netmon.NetMonitor(1.0)
+_NM.start_session(300)
+_T0 = _NM.session["started_mono"]
+
+
+def _flow(pid, rip, rport, conn=None, byte=None, amounts=None,
+          instances=1, idle=0, active=0, bo=0, bi=0):
+    _fk = netmon.flow_key_of(pid, "tcp4", rip, rport)
+    _f = netmon._Flow(_fk, pid, "tcp4", rip, rport, _T0)
+    _f.conn_events = list(conn or [])
+    _f.byte_events = list(byte or [])
+    _f.byte_amounts = list(amounts or [0] * len(byte or []))
+    _f.instances = instances
+    _f.idle_ticks = idle
+    _f.active_ticks = active
+    _f.bytes_out = bo
+    _f.bytes_in = bi
+    return _f
+
+
+def _proc(kind, score, level, cn="Test Vendor"):
+    return {"pid": 1, "name": "x.exe", "exe": r"C:\x.exe", "score": score,
+            "level": level, "signature": {"kind": kind, "cn": cn}}
+
+
+def _analyze(fl, kind, score, level, cn="Test Vendor"):
+    _NM._name_cache[fl.pid] = (f"p{fl.pid}.exe", r"C:\x.exe")
+    return _NM._analyze_flow(fl, [], {}, {fl.pid: _proc(kind, score, level, cn)}, 1.6, 1.0)
+
+
+def _ids(r):
+    return [f["rule_id"] for f in r["findings"]]
+
+
+# 场景 A：银狐 C2 心跳（IOC + 未签名 + 进程已判严重 + 完美周期）
+_fa = _flow(9001, "8.218.106.149", 443,
+            byte=_series(6, 60.0, 0.0), amounts=[148] * 6, idle=290, active=6,
+            bo=900, bi=200)
+_ra = _analyze(_fa, "forged", 100, "critical", "Bytedance Pte. Ltd.")
+check("A 场景判定为严重", _ra["level"] == "critical", f"{_ra['level']} {_ra['score']}")
+check("A 场景命中 N002（已知 C2）", "N002" in _ids(_ra), str(_ids(_ra)))
+check("A 场景命中 N001（心跳规律性）", "N001" in _ids(_ra))
+check("A 场景命中 N003（联合判定）", "N003" in _ids(_ra))
+check("A 场景命中 N005（高风险进程持有外联）", "N005" in _ids(_ra))
+check("A 场景规律性 > 95", (_ra["regularity"] or 0) > 95, f"{_ra['regularity']}")
+
+# 场景 B：签名的 Windows 遥测，同样极规律 —— 必须不产生任何告警
+_fb = _flow(9002, "4.145.79.82", 443, conn=_series(5, 75.0, 0.0), idle=1, active=0)
+_rb = _analyze(_fb, "ok", 0, "clean", "Microsoft Windows")
+check("B 场景（可信进程的高规律遥测）不命中任何规则", not _rb["findings"], str(_ids(_rb)))
+check("B 场景等级为 clean", _rb["level"] == "clean", f"{_rb['level']} {_rb['score']}")
+check("B 场景仍给出高规律性（规律性与风险分离）",
+      (_rb["regularity"] or 0) > 90, f"{_rb['regularity']}")
+
+# 场景 C：系统伪进程（无镜像文件）+ 规律的内网连接 —— 这是修过的误报点
+_fc = _flow(9003, "10.0.0.5", 445, conn=_series(5, 30.0, 0.0), idle=1, active=0)
+_rc = _analyze(_fc, "noimage", 0, "clean", "")
+check("C 场景（无镜像文件进程的规律内网连接）不命中任何规则",
+      not _rc["findings"], str(_ids(_rc)))
+
+# 场景 C2：签名尚未校验（unknown）同样不得定罪
+_fc2 = _flow(9004, "1.2.3.4", 443, conn=_series(5, 40.0, 0.0), idle=1, active=0)
+_rc2 = _analyze(_fc2, "unknown", 0, "clean", "")
+check("C2 场景（签名未校验）不命中 N001", "N001" not in _ids(_rc2), str(_ids(_rc2)))
+
+# 场景 D：未签名 + 高规律 + 普通公网端口 → 命中 N001
+_fd = _flow(9005, "1.2.3.4", 443, conn=_series(6, 45.0, 0.02), idle=1, active=0)
+_rd = _analyze(_fd, "unsigned", 45, "medium")
+check("D 场景（未签名 + 高规律）命中 N001", "N001" in _ids(_rd), str(_ids(_rd)))
+
+# 场景 E：数据持续传输（非心跳形态）→ 字节证据必须被弃用
+_fe = _flow(9006, "1.2.3.4", 443, byte=[i * 1.0 for i in range(60)],
+            amounts=[500] * 60, idle=2, active=58)
+_re = _analyze(_fe, "unsigned", 45, "medium")
+check("E 场景（持续传输）不因字节证据被误判为规律",
+      _re["regularity"] is None or _re["regularity"] < 55, f"{_re['regularity']}")
+check("E 场景给出「持续传输」说明",
+      any("持续传输" in n for n in _re["notes"]), str(_re["notes"]))
+
+# 场景 F：样本不足 → 规律性为 None 且不产生 N001
+_ff = _flow(9007, "1.2.3.4", 443, conn=[0.0, 60.0], idle=1, active=0)
+_rf = _analyze(_ff, "unsigned", 45, "medium")
+check("F 场景样本不足 → 规律性为 None", _rf["regularity"] is None)
+check("F 场景不命中 N001", "N001" not in _ids(_rf), str(_ids(_rf)))
+check("F 场景给出可读的样本不足说明",
+      any("至少需要" in n for n in _rf["notes"]), str(_rf["notes"]))
+
+# 场景 G：内网目标不得被判为高危（C2 几乎不会是内网）
+_fg = _flow(9008, "192.168.1.9", 443, conn=_series(6, 30.0, 0.0), idle=1, active=0)
+_rg = _analyze(_fg, "unsigned", 45, "medium")
+check("G 场景（未签名 + 规律内网外联）等级不超过 medium",
+      _rg["level"] in ("clean", "low", "medium"), f"{_rg['level']} {_rg['score']}")
+
+# 场景 H：进程已判高风险 + 公网连接（不依赖规律性）→ 命中 N005
+_fh = _flow(9009, "45.32.100.77", 45678, conn=[0.0, 12.0, 90.0], idle=1, active=0)
+_rh = _analyze(_fh, "unsigned", 58, "high")
+check("H 场景命中 N005", "N005" in _ids(_rh), str(_ids(_rh)))
+
+# 场景 I：非管理员降级 —— 字节统计不可用时仍能工作且明确标注
+_NM.estats_ok = False
+_NM.estats_note = "开启字节统计失败（通常因为非管理员权限），已退化为仅连接事件检测"
+_fi = _flow(9010, "1.2.3.4", 443, conn=_series(6, 30.0, 0.0), idle=1, active=0)
+_ri = _analyze(_fi, "unsigned", 45, "medium")
+check("I 场景（无字节统计）仍能靠连接事件给出规律性",
+      (_ri["regularity"] or 0) > 90, f"{_ri['regularity']}")
+_snap = _NM.snapshot()
+check("I 场景快照标注 estats 不可用", _snap["estats"] is False)
+check("I 场景快照携带降级说明", "非管理员" in (_snap["estats_note"] or ""))
+_NM.estats_ok = True
+
+# --- 10.8 采集层自检（真机）
+_st_test = netapi.selftest()
+check("netapi 扩展接口可用", _st_test["available"], _st_test.get("error", ""))
+check("netapi 能枚举到 TCP 连接", _st_test["tcp"] > 0, f"{_st_test['tcp']} 条")
+check("netapi 能枚举到 UDP 套接字", _st_test["udp"] > 0, f"{_st_test['udp']} 条")
+check("estats 每连接字节统计可读（需管理员）", _st_test["estats_ok"],
+      _st_test.get("estats_note", ""))
+
+# --- 10.9 零外联承诺：netmon/netapi 源码中不得出现任何网络客户端调用
+for _mod, _path in (("netmon", os.path.join(_common.app_dir(), "netmon.py")),
+                    ("netapi", os.path.join(_common.app_dir(), "netapi.py"))):
+    _src = open(_path, encoding="utf-8").read()
+    _bad = [k for k in ("urllib", "requests", "http.client", "socket.create_connection",
+                        "getaddrinfo", "gethostbyname", "urlopen", "subprocess")
+            if k in _src]
+    check(f"{_mod} 不含任何网络客户端/外联调用", not _bad, f"发现 {_bad}")
 
 print()
 print("=" * 72)

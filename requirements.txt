@@ -1,3 +1,7 @@
 # 银狐进程监视器依赖
-# 仅一个第三方库，其余全部使用 Python 标准库
+# 核心运行只需一个第三方库，其余全部使用 Python 标准库。
+# 网络采集层（app/netapi.py）不需要任何第三方库，直接 ctypes 调用 iphlpapi.dll。
 psutil>=5.9.0
+
+# 可选：仅 tools/shot_net.py（界面自动化质检）需要
+# playwright>=1.40.0
