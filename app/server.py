@@ -29,6 +29,7 @@ import netmon
 import paths
 import whitelist
 import rules
+import version
 import winapi
 
 # 兼容 PyInstaller 单文件打包后的资源路径
@@ -627,6 +628,11 @@ class Monitor:
                     "ioc_version": iocs.IOC_VERSION,
                     "ioc_sources": iocs.IOC_SOURCES,
                     "rule_count": len(_RULE_DOC),
+                    # 版本号必须下发到界面：本机存在多份副本时，
+                    # "我看到的是哪一版"是排查一切问题的第一步。
+                    "app_version": version.VERSION,
+                    "app_version_line": version.version_line(),
+                    "app_build": version.BUILD,
                     "net_enabled": self.netmon is not None,
                     "net_estats": bool(net and net.get("estats")),
                     "net_sample_interval": (net or {}).get("sample_interval"),
@@ -1322,7 +1328,7 @@ def build_report_html(st: dict) -> str:
  主机 {os.environ.get('COMPUTERNAME','')} ·
  用户 {os.environ.get('USERNAME','')} ·
  管理员权限：{'是' if s['admin'] else '否'} ·
- 已扫描 {s['scan_count']} 轮 · IOC 版本 {iocs.IOC_VERSION}</div>
+ 已扫描 {s['scan_count']} 轮 · IOC 版本 {iocs.IOC_VERSION} · 程序版本 {version.VERSION}</div>
 
 <div class="grid">
  <div class="kpi"><b>{s['total']}</b><span>进程总数</span></div>

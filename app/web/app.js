@@ -102,7 +102,7 @@ const LANGS = {
                 + '不上传任何服务器。',
     sec_write_on: '已启用', sec_write_off: '未启用',
     sec_write_note: '目的：防止任意网页通过跨站请求伪造调用本工具的结束进程 / 关停接口。',
-    sec_source_big: '{n} 条规则 · IOC {v}',
+    sec_source_big: '{n} 条规则 · IOC {v} · 程序版本 {ver}',
     sec_source_sub: '依据以下公开报告编制：',
     sec_accept_title: '重建完整性基线',
     sec_accept_body: '<div class="danger-note">⚠️ 只有在确认这些改动是你自己做的'
@@ -144,6 +144,7 @@ const LANGS = {
     sig_packaged_tip: '由应用包整体签名保护，不单独签名',
     sig_unsigned: '未签名', sig_failed: '校验失败',
     conn_lost: '连接中断', count_items: '{a} / {b} 项',
+    render_err: '界面渲染出错（按 F12 看控制台）',
     path_unreadable: '（无法读取路径）',
     chain_parent: '↑ 父进程',
     kv_pid: 'PID / PPID', kv_parent: '父进程', kv_user: '运行账户',
@@ -271,7 +272,7 @@ const LANGS = {
     sec_write_on: '已开启', sec_write_off: '没开启',
     sec_write_note: '目的：防止随便一个网页偷偷调用本工具，'
                   + '把你的程序结束掉、或者把它自己关掉。',
-    sec_source_big: '{n} 条检查规则 · 特征库 {v}',
+    sec_source_big: '{n} 条检查规则 · 特征库 {v} · 程序版本 {ver}',
     sec_source_sub: '判断依据来自这些公开报告：',
     sec_accept_title: '重建参照标准',
     sec_accept_body: '<div class="danger-note">⚠️ 只有在确认这些改动是你自己做的'
@@ -313,6 +314,7 @@ const LANGS = {
     sig_packaged_tip: '由整个应用包统一签名，不单独签',
     sig_unsigned: '没签名', sig_failed: '验签名失败',
     conn_lost: '连接中断', count_items: '{a} / {b} 个',
+    render_err: '界面显示出错了（按 F12 看控制台）',
     path_unreadable: '（读不到文件位置）',
     chain_parent: '↑ 启动它的',
     kv_pid: 'PID / PPID', kv_parent: '是谁启动的', kv_user: '以谁的身份运行',
@@ -532,19 +534,37 @@ function sigView(p) {
 
 /* ---------------------------------------------------- 轮询 */
 async function poll() {
+  let st;
   try {
     const r = await fetch('/api/state');
-    STATE = await r.json();
-    render();
+    st = await r.json();
   } catch (e) {
     $('#pillStatus').className = 'pill bad';
     $('#pillStatus').innerHTML = `<i class="dot"></i><span>${esc(T('conn_lost'))}</span>`;
+    return;
+  }
+  STATE = st;
+  // ⚠️ render 必须和 fetch 分开 try。
+  //    混在一起时，**渲染代码里的 bug 会被当成"连接中断"吞掉** ——
+  //    页面只是"少了半页"，控制台一片干净，界面测试因为"无 console error"
+  //    也照过，极难定位。实测踩过：render 里引用了一个不存在的变量
+  //    （sec），结果 KPI、表格全部没渲染，却没有任何报错。
+  try {
+    render();
+  } catch (e) {
+    console.error('[render] 渲染失败：', e);
+    const p = $('#pillStatus');
+    if (p) {
+      p.className = 'pill bad';
+      p.innerHTML = `<i class="dot"></i><span>${esc(T('render_err'))}</span>`;
+    }
   }
 }
 
 /* ---------------------------------------------------- 渲染 */
 function render() {
   const s = STATE.summary;
+  const sec = STATE.security || {};
   const L = s.levels;
 
   /* 顶栏状态 */
@@ -579,6 +599,11 @@ function render() {
   pa.title = s.admin ? T('admin_ok_tip') : T('admin_no_tip');
 
   $('#pillUptime').innerHTML = `<span>${esc(T('uptime'))} ${fmtUptime(s.uptime)}</span>`;
+
+  // 版本号常显：本机可能存在多份副本，"我看到的是哪一版"
+  // 是排查一切问题的第一步（实测用户就是因为跑着旧副本而以为功能坏了）。
+  const bv = $('#brandVer');
+  if (bv) bv.textContent = sec.app_version ? '  ·  v' + sec.app_version : '';
 
   /* KPI */
   const netSum = (STATE.net || {}).summary || {};
@@ -1274,7 +1299,7 @@ function renderSecurity() {
     <div class="seccard info">
       <h5>${esc(T('sec_source'))}</h5>
       <div class="big">${esc(Tn('sec_source_big', { n: sec.rule_count || 0,
-        v: sec.ioc_version || '' }))}</div>
+        v: sec.ioc_version || '', ver: sec.app_version_line || '—' }))}</div>
       <div class="sub">${esc(T('sec_source_sub'))}<ul>${
         (sec.ioc_sources || []).map((s) => `<li>${esc(s)}</li>`).join('')}</ul></div>
     </div>

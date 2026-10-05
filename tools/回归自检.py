@@ -920,6 +920,107 @@ check("真正的 Temp 目录仍算强信号（段级匹配不能把检出也砍�
 check("真正的 Downloads 目录仍算强信号",
       rules._in_strong_scan_context(r"C:\Users\x\Downloads"))
 
+# ================================================================
+# 14. 版本号 与 本机副本管理
+#
+# 背景：本机会自然长出多份副本（安装版 / 开源副本 / 打包 exe / 临时测试目录）。
+# 在加版本号之前，"哪个是最新版"只能靠文件修改时间猜 —— 实测已经出过问题：
+# 用户跑着旧副本，却以为功能坏了。所以加 version.py，并配一个副本管理器。
+#
+# 本节重点盯住**破坏性操作的两条底线**：
+#   ① 脱敏副本与完整副本绝不能互相覆盖（一个会泄露真实路径，一个会让工具失效）
+#   ② 覆盖时绝不能碰 python_path.txt / 备份 目录 / %LOCALAPPDATA% 下的用户数据
+# ================================================================
+print()
+print("=" * 72)
+print("14. 版本号 与 本机副本管理")
+print("=" * 72)
+
+import importlib  # noqa: E402
+import re as _re  # noqa: E402
+
+import version as _ver  # noqa: E402
+
+check("VERSION 形如 年.月.日[.序号]",
+      bool(_re.fullmatch(r"\d{4}\.\d{2}\.\d{2}(\.\d+)?", _ver.VERSION)), _ver.VERSION)
+check("compare：同日序号大者为新", _ver.compare("2026.10.05.3", "2026.10.05.2") == 1)
+check("compare：段数不同按 0 补齐（2026.10.05 == 2026.10.05.0）",
+      _ver.compare("2026.10.05", "2026.10.05.0") == 0)
+check("compare：日期新者为新", _ver.compare("2026.10.06", "2026.10.05.9") == 1)
+check("compare：相等返回 0", _ver.compare("2026.10.05.3", "2026.10.05.3") == 0)
+check("compare：异常输入不抛异常", isinstance(_ver.compare(None, "2026.10.05"), int))
+check("version_line 含版本号", _ver.VERSION in _ver.version_line())
+
+# ---- 副本管理：脱敏判定 + 覆盖计划（用临时目录做，不碰真实副本）
+#
+# ⚠️ 这里不能用安装版特有的 HERE 变量 —— 仓库版把本文件放在 tools/ 下、
+#    没有 HERE，同步脚本会因此报错。改成"往上找 本机副本管理.py"，
+#    两种布局都能定位到程序根目录。
+def _tool_root() -> str:
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(3):
+        if os.path.isfile(os.path.join(d, "本机副本管理.py")):
+            return d
+        d = os.path.dirname(d)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+sys.path.insert(0, _tool_root())
+_mgr = importlib.import_module("本机副本管理")
+
+import shutil as _sh  # noqa: E402
+import tempfile as _tf  # noqa: E402
+
+_tmp = _tf.mkdtemp(prefix="sfx-copytest-")
+
+
+def _make_copy(root, marker=""):
+    """造一个最小可识别副本：app/server.py + app/rules.py + app/version.py"""
+    os.makedirs(os.path.join(root, "app"), exist_ok=True)
+    for f in ("server.py", "rules.py"):
+        io.open(os.path.join(root, "app", f), "w", encoding="utf-8").write("# x\n")
+    io.open(os.path.join(root, "app", "version.py"), "w", encoding="utf-8").write(
+        'VERSION = "2026.10.05.3"\n')
+    if marker:
+        io.open(os.path.join(root, "app", "whitelist.py"), "w",
+                encoding="utf-8").write(f'NAME = "{marker}"\n')
+    io.open(os.path.join(root, "README.md"), "w", encoding="utf-8").write("readme\n")
+    return root
+
+
+_src = _make_copy(os.path.join(_tmp, "src"))
+_dst = _make_copy(os.path.join(_tmp, "dst"))
+io.open(os.path.join(_dst, "python_path.txt"), "w", encoding="utf-8").write("C:\\py.exe\n")
+io.open(os.path.join(_dst, "app", "server.py"), "w", encoding="utf-8").write("# OLD\n")
+
+check("能识别目录是不是工具副本", _mgr.is_copy(_src) and _mgr.is_copy(_dst))
+check("普通副本不被判为脱敏", not _mgr.looks_desensitized(_src))
+_des = _make_copy(os.path.join(_tmp, "des"), marker="my-watchdog")
+check("含占位符的副本被判为脱敏副本", _mgr.looks_desensitized(_des))
+
+# ⛔ 底线①：脱敏 ↔ 完整 互相覆盖必须被拒绝
+check("★ 拒绝用脱敏副本覆盖完整副本（否则工具会认不出本机真实任务名）",
+      _mgr.do_overwrite(_des, _src, yes=True) == 1)
+check("★ 拒绝用完整副本覆盖脱敏副本（否则真实路径会被推到公开仓库）",
+      _mgr.do_overwrite(_src, _des, yes=True) == 1)
+check("被拒绝后目标文件没被动过",
+      io.open(os.path.join(_src, "app", "server.py"), encoding="utf-8").read() == "# x\n")
+
+# ✅ 正常覆盖：旧内容被替换、python_path.txt 必须保留
+_plan = _mgr.plan_overwrite(_src, _dst)
+check("覆盖计划把 app 列入删除/重写", "app" in _plan["delete"])
+check("覆盖计划把 python_path.txt 列入保留", any("python_path" in k for k in _plan["keep"]),
+      str(_plan["keep"]))
+_rc = _mgr.do_overwrite(_src, _dst, yes=True)
+check("正常覆盖执行成功", _rc == 0)
+check("覆盖后内容与源一致",
+      io.open(os.path.join(_dst, "app", "server.py"), encoding="utf-8").read() == "# x\n")
+check("★ 覆盖后 python_path.txt 仍保留（机器相关配置不能被冲掉）",
+      os.path.isfile(os.path.join(_dst, "python_path.txt")))
+check("覆盖前自动做了备份", os.path.isdir(os.path.join(_dst, "备份")))
+
+_sh.rmtree(_tmp, ignore_errors=True)
+
 print()
 print("=" * 72)
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
