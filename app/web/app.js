@@ -762,6 +762,15 @@ function renderSecurity() {
         已校验 <code>${esc(it.checked || 0)}</code> 个文件<br>
         基线建立于 ${esc(it.baseline_time || '—')}
       </div>
+      <div class="sub" style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px">
+        本进程 PID <code>${esc(sec.self_pid || '—')}</code> ·
+        自身辅助子进程 <code>${esc(sec.own_children || 0)}</code> 个<br>
+        <span style="color:var(--dim)">
+          签名校验需要调用 PowerShell，这些子进程的命令行天然带"Base64 执行 / 绕过策略"特征。
+          它们按 <b>PID + 创建时间</b>精确排除，且随本进程退出被内核连带回收 ——
+          不会出现在告警里，也不会留下孤儿。
+        </span>
+      </div>
       ${changed.length ? `<div class="chg">${changed.slice(0, 8).map(esc).join('<br>')}</div>
         <div class="acts"><button class="btn" id="btnAcceptIntegrity">确认是我改的，重建基线</button></div>` : ''}
       <div class="sub" style="margin-top:7px">
