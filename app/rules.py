@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 
@@ -601,10 +602,15 @@ def rules_process(proc: dict, ctx: dict) -> list[dict]:
         (r"reg\s+add.*\\run\b", "P015", "命令行写入注册表启动项", "high", 72,
          "银狐使用 HKCU\\...\\CurrentVersion\\Run 建立用户级持久化。"),
     ]
+    # 只有命令行里出现 -enc 才去做 Base64 解码（避免给每个进程白付一次开销）
+    own_ps = bool(cmd) and ("-enc" in lcmd) and looks_like_own_aux_ps(cmd)
     for pat, rid, title, sev, w, advice in cmd_rules:
         if re.search(pat, lcmd):
+            adv = advice
+            if own_ps and rid in ("P010B", "P011"):
+                adv = advice + _OWN_PS_HINT
             fs.append(finding(rid, title, sev, w, "process",
-                              f"命令行：{cmd[:400]}", advice))
+                              f"命令行：{cmd[:400]}", adv))
 
     # ---- P016–P019 网络规则 ---------------------------------------------
     for c in conns:
@@ -717,6 +723,43 @@ def rules_process(proc: dict, ctx: dict) -> list[dict]:
 def _is_browser(lname: str) -> bool:
     return any(b in lname for b in
                ("chrome", "msedge", "firefox", "iexplore", "opera", "brave", "360se", "qqbrowser"))
+
+
+# 本工具自己调用 PowerShell 时固定使用的开头（见 winapi._PS_PREAMBLE）。
+_OWN_PS_MARK = "$ErrorActionPreference='SilentlyContinue';$ProgressPreference='SilentlyContinue'"
+
+
+def looks_like_own_aux_ps(cmd: str) -> bool:
+    """命令行里的 Base64 载荷解出来，是不是**本工具自己**的 PowerShell 开头。
+
+    ⚠️ 这个函数**只用来给证据补一句说明**，绝对不参与"是否告警"的判断。
+    原因：如果拿它来免除告警，就成了一条**免杀通道** —— 攻击者读一遍源码，
+    把自己的 PowerShell 前缀成同样的 preamble，从此对本工具隐身。
+    （自身辅助进程的排除走的是 PID 登记表 + 祖先链 + Job 回收，见
+      rules.is_own_aux_process；那套判据不可伪造。）
+
+    用途：同一个工具跑两份副本、或在监视器运行期间跑 tools/ 下的验证脚本时，
+    对方的校验进程会被本实例看到并告警。这一句说明能让人立刻明白
+    "这不是恶意行为，是同类工具的兄弟进程"，而不是去查一个不存在的木马。
+    """
+    m = re.search(r"-(?:encodedcommand|enc)\b[:\s]+([A-Za-z0-9+/=]{40,})", cmd, re.I)
+    if not m:
+        return False
+    b64 = m.group(1)
+    try:
+        raw = base64.b64decode(b64 + "=" * (-len(b64) % 4))
+        text = raw.decode("utf-16-le", "ignore")
+    except Exception:
+        return False
+    return _OWN_PS_MARK in text
+
+
+_OWN_PS_HINT = (
+    "\n\n⚠ 说明：该 Base64 解出来的内容与本工具自己的 PowerShell 开头逐字一致 —— "
+    "这极可能是**另一个「银狐进程监视器」实例、或 tools/ 下的验证脚本**拉起的校验进程，"
+    "而不是恶意行为。如果你确实开着多份副本或刚跑过验证脚本，确认后可用「已知项」忽略。"
+    "（本工具自身的辅助进程会按 PID + 创建时间精确排除；跨副本无法识别，属已知边界。）"
+)
 
 
 # ================================================================

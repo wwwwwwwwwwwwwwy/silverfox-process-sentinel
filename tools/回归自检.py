@@ -510,7 +510,8 @@ import winapi as _w2  # noqa: E402
 # 所以命令行里必然出现该 preamble 的 base64 前缀 —— 这是**测试用**的精确标识，
 # 绝不能拿它当排除判据（那就成了免杀通道，见下面的守卫断言）。
 import base64 as _b64  # noqa: E402
-_PS_MARK = _b64.b64encode(_w2._PS_PREAMBLE.encode("utf-16-le")).decode()[:48]
+_PS_B64 = _b64.b64encode(_w2._PS_PREAMBLE.encode("utf-16-le")).decode()
+_PS_MARK = _PS_B64[:48]
 
 _SELF = 12345
 _CTX0 = {"by_pid": {}, "sig_cache": {}, "artifacts": {}, "self_pid": _SELF,
@@ -544,11 +545,21 @@ check("完全无关的进程 → 不排除", not rules.is_own_aux_process(_mkp(1
 #    读一遍源码就能隐身。这条断言就是防止日后有人那样"简化"。
 _EVADE = _mkp(100, 999,
               cmd="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
-                  "-EncodedCommand JABFAHIAcgBvAHIAQQBjAHQAaQBvAG4AUAByAGUAZgBlAHIAZQBuAGMAZQA9",
+                  "-EncodedCommand " + _PS_B64,
               exe=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
 _ev_ids = [f["rule_id"] for f in rules.rules_process(_EVADE, _CTX0)]
 check("⛔ 仅凭「命令行含本工具 preamble」不得免除告警（防免杀通道）",
       "P010B" in _ev_ids or "P011" in _ev_ids, f"命中 {_ev_ids or '无'}")
+
+# 识别"这是同类工具的兄弟进程"只用于补一句证据说明，不改变告警与否
+_ev_fs = rules.rules_process(_EVADE, _CTX0)
+check("证据里补上了「疑似本工具同类进程」的说明",
+      any("本工具自己的 PowerShell 开头" in (f.get("advice") or "") for f in _ev_fs))
+check("补说明没有改变判定结果（仍然命中）", bool(_ev_fs), f"{len(_ev_fs)} 条")
+_OTHER_B64 = _b64.b64encode("Write-Host hello world".encode("utf-16-le")).decode()
+check("别的 Base64 载荷不会被误认成本工具 preamble",
+      not rules.looks_like_own_aux_ps(
+          f"pwsh.exe -EncodedCommand {_OTHER_B64}"))
 
 check("PS_EXE 是绝对路径（不靠 PATH 解析）", os.path.isabs(_w2.PS_EXE), _w2.PS_EXE)
 check("PS_EXE 实际存在", os.path.isfile(_w2.PS_EXE), _w2.PS_EXE)
