@@ -784,6 +784,25 @@ check("详情章节数量 == 严重+高危合计",
       f"五、高危项详情与处置建议 —— {_c2 + _h2n} 项" in _h2,
       f"期望 {_c2 + _h2n}")
 
+# 12.6 告警记录必须携带 advice
+#      —— 像"这条可能是本工具自己的同类进程"这种关键提示写在 advice 里。
+#         初版只带 evidence，导致提示只出现在进程详情里、在最需要的告警时间线上缺席。
+class _AlertSink:
+    def __init__(self):
+        self.alerts = []
+
+
+_AlertSink._push_alert = _srv.Monitor._push_alert
+_sink = _AlertSink()
+_sink._push_alert({"level": "high", "score": 72.5, "name": "pwsh.exe", "pid": 4242,
+                   "ppid": 111, "parent_name": "python.exe", "exe": "C:\\x.exe",
+                   "findings": [_mk_f("P010B", "medium", 55)]})
+check("告警记录里带上了 advice（否则关键提示不会出现在告警时间线）",
+      bool(_sink.alerts and _sink.alerts[0]["rules"][0].get("advice")),
+      str(_sink.alerts[0]["rules"][0] if _sink.alerts else None)[:80])
+check("告警记录里带上了父进程信息（排查同类误报的关键线索）",
+      _sink.alerts[0].get("ppid") == 111 and _sink.alerts[0].get("parent") == "python.exe")
+
 print()
 print("=" * 72)
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")

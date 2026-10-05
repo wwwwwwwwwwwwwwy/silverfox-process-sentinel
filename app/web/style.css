@@ -546,3 +546,11 @@ table.netgrid tbody tr.reg-hi.high{box-shadow:inset 3px 0 0 0 var(--high)}
   padding:10px 13px;border-radius:8px;margin-bottom:11px;
 }
 .arthint b{color:var(--text-2)}
+
+/* 告警时间线里的处置建议 —— 像"这条可能是本工具自己的同类进程"这类
+   关键提示写在 advice 里，必须让用户在告警列表就能看到，而不是要翻详情。 */
+.alarm-adv{
+  margin-top:5px;padding:7px 10px;border-radius:6px;font-size:11.5px;line-height:1.65;
+  color:#8fd6a8;background:rgba(63,185,80,.07);border-left:2px solid rgba(63,185,80,.4);
+  white-space:pre-wrap;
+}

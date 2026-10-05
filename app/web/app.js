@@ -680,7 +680,8 @@ function renderAlerts() {
   $('#alertList').innerHTML = list.map((a) => {
     const rules = (a.rules || []).map((r) => `
       <div class="alarm-rule">[${esc(r.id)}] ${esc(r.title)}
-        <div class="ev">${esc(r.evidence)}</div></div>`).join('');
+        <div class="ev">${esc(r.evidence)}</div>
+        ${r.advice ? `<div class="alarm-adv">${esc(r.advice)}</div>` : ''}</div>`).join('');
     return `<div class="alertitem ${a.level}${a.net ? ' netalert' : ''}"
         ${a.net_key ? `data-nkey="${esc(a.net_key)}"` : ''}>
       <div class="alarm-head">

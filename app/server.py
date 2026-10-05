@@ -485,7 +485,11 @@ class Monitor:
             "self_pid": os.getpid(),
             "exe": p.get("exe", ""),
             "rules": [{"id": f["rule_id"], "title": f["title"],
-                       "severity": f["severity"], "evidence": f["evidence"]} for f in top],
+                       "severity": f["severity"], "evidence": f["evidence"],
+                       # advice 必须一起带上：像"这条其实可能是本工具自己的同类进程"
+                       # 这类关键提示就写在 advice 里，而用户最先看到的就是告警时间线。
+                       # 初版只带 evidence，导致提示只在进程详情里出现、在最需要的地方缺席。
+                       "advice": f.get("advice", "")} for f in top],
             "text": f"新增{p['level']}级进程：{p['name']} (PID {p['pid']}) · " +
                     "；".join(f["title"] for f in top),
         })
@@ -532,8 +536,8 @@ class Monitor:
             "net_key": f["key"],
             "net": True,
             "rules": [{"id": x["rule_id"], "title": x["title"],
-                       "severity": x["severity"], "evidence": x["evidence"]}
-                      for x in top],
+                       "severity": x["severity"], "evidence": x["evidence"],
+                       "advice": x.get("advice", "")} for x in top],
             "text": f"[网络] {f['verdict']} · " + "；".join(x["title"] for x in top[:2]),
         })
         del self.alerts[200:]
