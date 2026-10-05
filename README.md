@@ -1059,3 +1059,41 @@ icacls "<路径>" /setowner "BUILTIN\Administrators" /T /C
 不采集、不上传、不联网回传任何数据——所有数据都留在本机，HTTP 服务仅监听 `127.0.0.1`。
 
 请勿将本工具用于未经授权的系统。
+
+## 九、发布新版本（维护者）
+
+改完代码后按这个顺序走，缺一步就会出现"用户看到的和我以为的不一样"：
+
+```
+1. 递增版本号
+     改 app/version.py 的 VERSION（年.月.日.序号），例如 2026.10.05.3 → 2026.10.06.0
+     ⚠️ 改了 app/ 下任何文件都要递增，否则副本管理器会误判新旧
+
+2. 跑两边的自检
+     python 回归自检.py              # 安装版（完整副本）
+     cd tools && python 回归自检.py   # 仓库版（脱敏副本）
+
+3. 重建完整性基线（否则界面顶栏一直红着）
+     cd app && python -m integrity --accept
+
+4. 同步到仓库（单向：安装版 → 仓库，带脱敏替换）
+     python sync_net_to_repo.py
+     ⚠️ 绝不能反向覆盖 —— 会把真实用户名与路径推到公开仓库
+
+5. 提交并推送
+     git add -A && git commit
+     git push origin main
+
+6. 打标签 + 建 Release
+     git tag -a v<版本号> -m "<发布说明>"
+     git push origin v<版本号>
+     然后在网页上：Tags → 选该标签 → Create release
+     （或调 API：POST /repos/:owner/:repo/releases，带 tag_name / name / body）
+
+7. 更新本机其它副本
+     python 本机副本管理.py            # 先看清单
+     python 本机副本管理.py --update <最新版目录>
+```
+
+**发布说明里要如实写边界**（纯内存执行覆盖不了、非管理员时长连接心跳可能漏检、
+同机双副本会互相误报）。藏着边界比写出来更伤信任。
