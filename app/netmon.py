@@ -357,6 +357,11 @@ class NetMonitor:
         self.estats_ok = False
         self.estats_note = ""
         self.estats_fail_streak = 0
+        # F-011：退避重试的下次允许时间。旧逻辑里失败计数**只增不减**，
+        # 三次瞬时失败就把字节证据流关到本次会话结束 —— 而"长连接上的心跳"
+        # 恰恰只能靠字节计数发现，等于永久漏检。改成失败可退避重试、
+        # 成功即清零，并把降级原因说清楚（不再一律甩给"权限"）。
+        self.estats_retry_after = 0.0
         self._results: list[dict] = []
         self._result_tick = -1
         self._result_at = 0.0
@@ -418,7 +423,17 @@ class NetMonitor:
 
         拖长 → 会话继续收集；拖短到已过时长之下 → 立即结算。
         """
-        duration = max(5.0, min(7200.0, float(duration or DEFAULT_DURATION)))
+        # F-003：非有限值（NaN / inf）必须**明确拒绝**，不能静默钳成边界值。
+        # 旧写法 max(5.0, min(7200.0, nan)) 在 CPython 上会得到 7200.0，
+        # 但返回消息用的是原值 —— 于是接口回"已改为 0.0 秒"而实际是 7200 秒，
+        # 用户和日志都对不上。这类"说得和做的不一样"比报错更难查。
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError):
+            return {"ok": False, "bad": True, "msg": "观测时长必须是数字"}
+        if not math.isfinite(duration):
+            return {"ok": False, "bad": True, "msg": "观测时长必须是有限数字（不接受 NaN / 无穷）"}
+        duration = max(5.0, min(7200.0, duration))
         with self.lock:
             if not self.session or self.session["phase"] != "collecting":
                 restart = True
@@ -541,11 +556,19 @@ class NetMonitor:
                     if c["proto"].startswith("tcp") and self.estats_ok:
                         if netapi.enable_estats(c):
                             st.enabled = True
+                            # 成功即清零：否则历史上攒下的失败次数会把
+                            # 后来的一次瞬时抖动直接推过阈值。
+                            self.estats_fail_streak = 0
+                            self.estats_retry_after = 0.0
                         else:
                             self.estats_fail_streak += 1
-                            if self.estats_fail_streak >= 3:
+                            if self.estats_fail_streak >= 3 and self.estats_ok:
                                 self.estats_ok = False
-                                self.estats_note = "开启字节统计失败（通常因为非管理员权限），已退化为仅连接事件检测"
+                                self.estats_retry_after = now + 60.0
+                                self.estats_note = (
+                                    "开启字节统计失败，已暂时退化为仅连接事件检测"
+                                    "（60 秒后自动重试）。若持续失败，"
+                                    "常见原因是未以管理员身份运行")
                 else:
                     st.last_seen = now
 

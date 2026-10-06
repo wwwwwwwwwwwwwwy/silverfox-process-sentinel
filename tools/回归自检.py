@@ -135,7 +135,17 @@ print("=" * 72)
 # hosts 一行多主机名
 hosts_file = os.path.join(_common.app_dir(), "winapi.py")
 src = open(hosts_file, encoding="utf-8").read()
-seg = src[src.find("def read_hosts"):src.find("def read_hosts") + 1200]
+# ⚠️ 别用固定长度的源码窗口（原先取 def 之后 1200 字符）——
+#    函数体稍一变长，断言就会因为"截不到那一段"而假失败，
+#    和被测行为其实毫无关系。按缩进把整个函数体取出来。
+_lines = src.splitlines()
+_i = next(i for i, l in enumerate(_lines) if l.startswith("def read_hosts"))
+_body = []
+for _l in _lines[_i + 1:]:
+    if _l.strip() and not _l.startswith((" ", "\t")):
+        break
+    _body.append(_l)
+seg = "\n".join(_body)
 check("hosts 支持一行写多个主机名", "parts[1:]" in seg or "for h in" in seg)
 
 # P014 覆盖多种杀安全软件写法
@@ -1020,6 +1030,293 @@ check("★ 覆盖后 python_path.txt 仍保留（机器相关配置不能被冲�
 check("覆盖前自动做了备份", os.path.isdir(os.path.join(_dst, "备份")))
 
 _sh.rmtree(_tmp, ignore_errors=True)
+
+
+
+# ================================================================
+# 15. 红队审计修复的回归断言
+#
+# 来源：2026-10-06 红蓝对抗（REPORT.md / findings.red.json / 修改建议.md）。
+# 本节只放**不需要起服务**就能验的；需要打接口的（GET 来源校验、告警忽略、
+# 报告导出）由 _dev 下的接口测试脚本覆盖。
+# ================================================================
+print()
+print("=" * 72)
+print("15. 红队审计修复")
+print("=" * 72)
+
+import integrity as _it  # noqa: E402
+import server as _srvmod  # noqa: E402
+import version as _v  # noqa: E402
+import whitelist as _wl  # noqa: E402
+
+_srv = io.open(os.path.join(_common.app_dir(), "server.py"), encoding="utf-8").read()
+_mn = io.open(os.path.join(_common.app_dir(), "main.py"), encoding="utf-8").read()
+_itg = io.open(os.path.join(_common.app_dir(), "integrity.py"), encoding="utf-8").read()
+_wls = io.open(os.path.join(_common.app_dir(), "whitelist.py"), encoding="utf-8").read()
+_col = io.open(os.path.join(_common.app_dir(), "collector.py"), encoding="utf-8").read()
+_wap = io.open(os.path.join(_common.app_dir(), "winapi.py"), encoding="utf-8").read()
+_js = io.open(os.path.join(_common.app_dir(), "web", "app.js"), encoding="utf-8").read()
+
+# ---- F-013 · extras 只有一处来源
+check("F-013 运行期 extras 走 default_extras",
+      "return integrity.default_extras()" in _srv)
+check("F-013 --verify-only 走 default_extras", "integrity.default_extras()" in _mn)
+check("F-013 不再有内联的 [sys.executable] if ... frozen 写法",
+      "extra = [sys.executable] if getattr(sys" not in _srv
+      and "extra = [sys.executable] if getattr(sys" not in _mn)
+# ⚠️ 不能断言"返回值里一定含这两个文件" —— python_path.txt 与 whitelist.json
+#    是**机器相关**的（都在 .gitignore 里），仓库副本里根本不存在。
+#    断言"源码层面覆盖了它们"才在两种副本上都成立。
+check("F-013 extras 覆盖 python_path.txt 与 whitelist.json（源码层面）",
+      "paths.PYTHON_PATH_FILE" in _itg and "paths.WHITELIST_FILE" in _itg)
+
+# ---- F-014 · 启动链纳入覆盖
+_ex = _it.default_extras()
+check("F-014 .bat 在覆盖范围内", any(p.lower().endswith(".bat") for p in _ex))
+check("F-014 extras 的键带 <root>/ 前缀（避免与 app/ 相对路径撞名）",
+      any(k.startswith("<root>/") for k in
+          _it.collect_manifest(_common.app_dir(), _ex)))
+
+# ---- F-015 · 基线按安装分文件
+check("F-015 不同 app_dir 得到不同基线文件名",
+      _it.baseline_path("X", "C:/A") != _it.baseline_path("X", "C:/B"))
+check("F-015 不同 app_dir 得到不同哨兵文件名",
+      _it.sentinel_path("C:/A") != _it.sentinel_path("C:/B"))
+check("F-015 verify 按 app_dir 读基线", "load_baseline(workspace, app_dir)" in _itg)
+check("F-015 save_baseline 按 app_dir 写基线",
+      "baseline_path(workspace, app_dir)" in _itg)
+
+# ---- F-016 · 身份判定与哨兵目录
+check("F-016 归属只看 app_dir（数据目录变了仍算本安装）",
+      _it.sentinel_belongs_here({"app_dir": "C:/A", "workspace": "Z:/other"}, "C:/A"))
+check("F-016 别的安装的哨兵不算本安装",
+      not _it.sentinel_belongs_here({"app_dir": "C:/B"}, "C:/A"))
+check("F-016 哨兵目录是绝对路径", os.path.isabs(_it.SENTINEL_DIR))
+check("F-016 不再用可能没被展开的 expandvars(%LOCALAPPDATA%)",
+      'expandvars(r"%LOCALAPPDATA%")' not in _itg)
+check("F-016 count 被真正读取（交叉校验）", "count_mismatch" in _itg)
+check("F-016 数据目录落在程序目录时会暴露给界面",
+      "data_on_program_dir" in _srv)
+
+# ---- F-001 · rule_only 后门
+check("F-001 rule_only 不在合法匹配方式里", "rule_only" not in _wl.MATCH_TYPES)
+check("F-001 历史 rule_only 条目 fail-closed",
+      not _wl.entry_matches({"rule_id": "P001",
+                             "match": {"type": "rule_only", "value": ""}, "guard": {}},
+                            {"rule_id": "P001"}, {"exe": "x", "name": "y"}))
+for _args, _name in ((("P001", "rule_only", ""), "rule_only"),
+                     (("P001", "exe_path", ""), "空匹配值")):
+    try:
+        _wl.add(*_args)
+        check(f"F-001 add() 拒绝{_name}", False)
+    except ValueError:
+        check(f"F-001 add() 拒绝{_name}", True)
+check("F-001 服务端显式拒绝 rule_only", "不支持按规则号全量豁免" in _srv)
+check("F-001 服务端要求指明对象", "必须指明这条已知项针对哪个对象" in _srv)
+check("F-001 服务端断言只命中一个对象", "会同时命中" in _srv)
+check("F-001 匹配值有具体性下限",
+      bool(_srvmod._match_too_broad("exe_path_prefix", "C:\\"))
+      and not bool(_srvmod._match_too_broad(
+          "exe_path_prefix", "C:\\Program Files\\Vendor\\App\\")))
+check("F-001 suggest() 不再产出 rule_only",
+      '"rule_only", ""' not in
+      io.open(os.path.join(_common.app_dir(), "whitelist.py"), encoding="utf-8").read())
+
+# ---- F-002 · 基线丢失不得静默重建
+# 断言前先把空白压平 —— 否则源码一换行（本来就该换行）断言就假失败
+_srv_flat = " ".join(_srv.split())
+check("F-002 刷新基线前先判哨兵归属",
+      "sentinel_belongs_here( integrity.load_sentinel(APP_DIR), APP_DIR)" in _srv_flat)
+check("F-002 拒绝刷新时返回非空（界面能显示 blocked）",
+      "已拒绝刷新基线" in _srv)
+
+# ---- F-005 · GET 来源校验
+check("F-005 do_GET 调用来源校验", "_guard_origin_host()" in _srv)
+check("F-005 来源校验被抽成独立方法（POST/GET 共用）",
+      "def _guard_origin_host" in _srv)
+check("F-005 Host 解析正确处理 IPv6", 'h.startswith("[")' in _srv)
+
+# ---- F-017 · 白名单原子写与损坏保护
+check("F-017 save() 原子替换", "os.replace(" in _wls and ".tmp" in _wls)
+check("F-017 损坏时返回 _corrupt 而不是空表", '"_corrupt": repr(e)' in _wls)
+check("F-017 add/remove 持锁", "_LOCK" in _wls)
+check("F-017 服务端对损坏回 409", "409" in _srv)
+
+# ---- F-018 · 守卫哈希上限
+check("F-018 守卫哈希有上限且超限不放行", "_GUARD_MAX_BYTES" in _wls)
+
+# ---- F-006 / F-007 · 降级可恢复、可见
+check("F-006 失败结果不写进 sig_cache", "_sig_failed" in _srv
+      and '"kind": "unknown"' not in _srv)
+check("F-006 state 暴露 sig_failed", '"sig_failed"' in _srv)
+check("F-007 命令行拉黑带 TTL", "_DENY_TTL" in _col
+      and "time.monotonic() < _denied_names[" in _col)
+check("F-007 state 暴露 cmdline_denied", '"cmdline_denied"' in _srv)
+
+# ---- F-008 · 制品采集分节
+check("F-008 分节输出（PS 侧有 ##SEC）", "##SEC " in _wap)
+check("F-008 缺失小节记入 _unavailable", "_unavailable" in _wap)
+check("F-008 报告里区分「未取到」", "未取到" in _srv)
+
+# ---- F-009 / F-010 / F-011 / F-012 / F-019
+_bad_js = [i for i, l in enumerate(_js.splitlines(), 1)
+           if "localStorage." in l and l and not l[0].isspace()]
+check("F-009 前端无未保护的顶层 localStorage 访问", not _bad_js, str(_bad_js[:3]))
+check("F-010 移除已知项用事件委托",
+      "$('#secBox').addEventListener('click'" in _js)
+_nm = io.open(os.path.join(_common.app_dir(), "netmon.py"), encoding="utf-8").read()
+check("F-011 estats 失败可退避重试", "estats_retry_after" in _nm)
+check("F-011 estats 成功即清零失败计数", "self.estats_fail_streak = 0" in _nm)
+check("F-012 hosts 按 BOM/签名判编码", "raw[:2] in (b" in _wap
+      and "raw[:3] == b" in _wap)
+check("F-003 非有限时长明确拒绝", 'not math.isfinite(duration)' in _nm
+      and '"bad": True' in _nm)
+check("F-019 compare 对上标数字不抛异常",
+      isinstance(_v.compare("2026.10.05\u00b2", "2026.10.05"), int))
+
+
+
+# ================================================================
+# 15. 红队审计修复的回归断言
+#
+# 来源：2026-10-06 红蓝对抗（REPORT.md / findings.red.json / 修改建议.md）。
+# 本节只放**不需要起服务**就能验的；需要打接口的（GET 来源校验、告警忽略、
+# 报告导出）由 _dev 下的接口测试脚本覆盖。
+# ================================================================
+print()
+print("=" * 72)
+print("15. 红队审计修复")
+print("=" * 72)
+
+import integrity as _it  # noqa: E402
+import version as _v  # noqa: E402
+import whitelist as _wl  # noqa: E402
+
+_srv = io.open(os.path.join(_common.app_dir(), "server.py"), encoding="utf-8").read()
+_mn = io.open(os.path.join(_common.app_dir(), "main.py"), encoding="utf-8").read()
+_itg = io.open(os.path.join(_common.app_dir(), "integrity.py"), encoding="utf-8").read()
+_wls = io.open(os.path.join(_common.app_dir(), "whitelist.py"), encoding="utf-8").read()
+_col = io.open(os.path.join(_common.app_dir(), "collector.py"), encoding="utf-8").read()
+_wap = io.open(os.path.join(_common.app_dir(), "winapi.py"), encoding="utf-8").read()
+_js = io.open(os.path.join(_common.app_dir(), "web", "app.js"), encoding="utf-8").read()
+
+# ---- F-013 · extras 只有一处来源
+check("F-013 运行期 extras 走 default_extras",
+      "return integrity.default_extras()" in _srv)
+check("F-013 --verify-only 走 default_extras", "integrity.default_extras()" in _mn)
+check("F-013 不再有内联的 [sys.executable] if ... frozen 写法",
+      "extra = [sys.executable] if getattr(sys" not in _srv
+      and "extra = [sys.executable] if getattr(sys" not in _mn)
+# ⚠️ 不能断言"返回值里一定含这两个文件" —— python_path.txt 与 whitelist.json
+#    是**机器相关**的（都在 .gitignore 里），仓库副本里根本不存在。
+#    断言"源码层面覆盖了它们"才在两种副本上都成立。
+check("F-013 extras 覆盖 python_path.txt 与 whitelist.json（源码层面）",
+      "paths.PYTHON_PATH_FILE" in _itg and "paths.WHITELIST_FILE" in _itg)
+
+# ---- F-014 · 启动链纳入覆盖
+_ex = _it.default_extras()
+check("F-014 .bat 在覆盖范围内", any(p.lower().endswith(".bat") for p in _ex))
+check("F-014 extras 的键带 <root>/ 前缀（避免与 app/ 相对路径撞名）",
+      any(k.startswith("<root>/") for k in
+          _it.collect_manifest(_common.app_dir(), _ex)))
+
+# ---- F-015 · 基线按安装分文件
+check("F-015 不同 app_dir 得到不同基线文件名",
+      _it.baseline_path("X", "C:/A") != _it.baseline_path("X", "C:/B"))
+check("F-015 不同 app_dir 得到不同哨兵文件名",
+      _it.sentinel_path("C:/A") != _it.sentinel_path("C:/B"))
+check("F-015 verify 按 app_dir 读基线", "load_baseline(workspace, app_dir)" in _itg)
+check("F-015 save_baseline 按 app_dir 写基线",
+      "baseline_path(workspace, app_dir)" in _itg)
+
+# ---- F-016 · 身份判定与哨兵目录
+check("F-016 归属只看 app_dir（数据目录变了仍算本安装）",
+      _it.sentinel_belongs_here({"app_dir": "C:/A", "workspace": "Z:/other"}, "C:/A"))
+check("F-016 别的安装的哨兵不算本安装",
+      not _it.sentinel_belongs_here({"app_dir": "C:/B"}, "C:/A"))
+check("F-016 哨兵目录是绝对路径", os.path.isabs(_it.SENTINEL_DIR))
+check("F-016 不再用可能没被展开的 expandvars(%LOCALAPPDATA%)",
+      'expandvars(r"%LOCALAPPDATA%")' not in _itg)
+check("F-016 count 被真正读取（交叉校验）", "count_mismatch" in _itg)
+check("F-016 数据目录落在程序目录时会暴露给界面",
+      "data_on_program_dir" in _srv)
+
+# ---- F-001 · rule_only 后门
+check("F-001 rule_only 不在合法匹配方式里", "rule_only" not in _wl.MATCH_TYPES)
+check("F-001 历史 rule_only 条目 fail-closed",
+      not _wl.entry_matches({"rule_id": "P001",
+                             "match": {"type": "rule_only", "value": ""}, "guard": {}},
+                            {"rule_id": "P001"}, {"exe": "x", "name": "y"}))
+for _args, _name in ((("P001", "rule_only", ""), "rule_only"),
+                     (("P001", "exe_path", ""), "空匹配值")):
+    try:
+        _wl.add(*_args)
+        check(f"F-001 add() 拒绝{_name}", False)
+    except ValueError:
+        check(f"F-001 add() 拒绝{_name}", True)
+check("F-001 服务端显式拒绝 rule_only", "不支持按规则号全量豁免" in _srv)
+check("F-001 服务端要求指明对象", "必须指明这条已知项针对哪个对象" in _srv)
+check("F-001 服务端断言只命中一个对象", "会同时命中" in _srv)
+check("F-001 匹配值有具体性下限",
+      bool(_srvmod._match_too_broad("exe_path_prefix", "C:\\"))
+      and not bool(_srvmod._match_too_broad(
+          "exe_path_prefix", "C:\\Program Files\\Vendor\\App\\")))
+check("F-001 suggest() 不再产出 rule_only",
+      '"rule_only", ""' not in
+      io.open(os.path.join(_common.app_dir(), "whitelist.py"), encoding="utf-8").read())
+
+# ---- F-002 · 基线丢失不得静默重建
+# 断言前先把空白压平 —— 否则源码一换行（本来就该换行）断言就假失败
+_srv_flat = " ".join(_srv.split())
+check("F-002 刷新基线前先判哨兵归属",
+      "sentinel_belongs_here( integrity.load_sentinel(APP_DIR), APP_DIR)" in _srv_flat)
+check("F-002 拒绝刷新时返回非空（界面能显示 blocked）",
+      "已拒绝刷新基线" in _srv)
+
+# ---- F-005 · GET 来源校验
+check("F-005 do_GET 调用来源校验", "_guard_origin_host()" in _srv)
+check("F-005 来源校验被抽成独立方法（POST/GET 共用）",
+      "def _guard_origin_host" in _srv)
+check("F-005 Host 解析正确处理 IPv6", 'h.startswith("[")' in _srv)
+
+# ---- F-017 · 白名单原子写与损坏保护
+check("F-017 save() 原子替换", "os.replace(" in _wls and ".tmp" in _wls)
+check("F-017 损坏时返回 _corrupt 而不是空表", '"_corrupt": repr(e)' in _wls)
+check("F-017 add/remove 持锁", "_LOCK" in _wls)
+check("F-017 服务端对损坏回 409", "409" in _srv)
+
+# ---- F-018 · 守卫哈希上限
+check("F-018 守卫哈希有上限且超限不放行", "_GUARD_MAX_BYTES" in _wls)
+
+# ---- F-006 / F-007 · 降级可恢复、可见
+check("F-006 失败结果不写进 sig_cache", "_sig_failed" in _srv
+      and '"kind": "unknown"' not in _srv)
+check("F-006 state 暴露 sig_failed", '"sig_failed"' in _srv)
+check("F-007 命令行拉黑带 TTL", "_DENY_TTL" in _col
+      and "time.monotonic() < _denied_names[" in _col)
+check("F-007 state 暴露 cmdline_denied", '"cmdline_denied"' in _srv)
+
+# ---- F-008 · 制品采集分节
+check("F-008 分节输出（PS 侧有 ##SEC）", "##SEC " in _wap)
+check("F-008 缺失小节记入 _unavailable", "_unavailable" in _wap)
+check("F-008 报告里区分「未取到」", "未取到" in _srv)
+
+# ---- F-009 / F-010 / F-011 / F-012 / F-019
+_bad_js = [i for i, l in enumerate(_js.splitlines(), 1)
+           if "localStorage." in l and l and not l[0].isspace()]
+check("F-009 前端无未保护的顶层 localStorage 访问", not _bad_js, str(_bad_js[:3]))
+check("F-010 移除已知项用事件委托",
+      "$('#secBox').addEventListener('click'" in _js)
+_nm = io.open(os.path.join(_common.app_dir(), "netmon.py"), encoding="utf-8").read()
+check("F-011 estats 失败可退避重试", "estats_retry_after" in _nm)
+check("F-011 estats 成功即清零失败计数", "self.estats_fail_streak = 0" in _nm)
+check("F-012 hosts 按 BOM/签名判编码", "raw[:2] in (b" in _wap
+      and "raw[:3] == b" in _wap)
+check("F-003 非有限时长明确拒绝", 'not math.isfinite(duration)' in _nm
+      and '"bad": True' in _nm)
+check("F-019 compare 对上标数字不抛异常",
+      isinstance(_v.compare("2026.10.05\u00b2", "2026.10.05"), int))
 
 print()
 print("=" * 72)

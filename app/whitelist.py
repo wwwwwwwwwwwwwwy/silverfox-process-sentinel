@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 
 import paths
@@ -47,8 +48,13 @@ MATCH_TYPES = {
     "exe_path": "可执行文件路径完全相同",
     "exe_path_prefix": "可执行文件路径以指定前缀开头",
     "subject_text_contains": "对象信息（路径/命令行/名称/标题）包含指定文本",
-    "rule_only": "仅按规则号匹配（需谨慎，建议配合守卫哈希）",
+    # ⚠️ rule_only 已于 2026-10-06 移除 —— 它是一条「按规则号全量豁免」的后门：
+    #    一条 entry 就能把某条规则对**所有对象**关掉。详见 entry_matches() 里的注释。
 }
+
+
+# 守卫文件哈希上限：与 listing() 里的展示上限保持一致（8 MB）
+_GUARD_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _sha256(path: str) -> str:
@@ -60,6 +66,13 @@ def _sha256(path: str) -> str:
         return h.hexdigest()
     except Exception:
         return ""
+
+
+# F-017：白名单是**读改写**的共享文件，而读方有两路（扫描线程每 3 秒
+# filter_findings、/api/state 每 2 秒 listing），写方是界面。没有锁 + 非原子写时，
+# 一次并发就足以把文件写坏；而旧 load() 把"损坏"与"合法空表"压成同一个返回，
+# 于是一次 add/remove 就会把空表写回去 → **全部已知项永久丢失**。
+_LOCK = threading.RLock()
 
 
 def load() -> dict:
@@ -75,22 +88,46 @@ def load() -> dict:
         with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
         if isinstance(d, dict) and isinstance(d.get("entries"), list):
-            return d
+            return _annotate(d)
     except FileNotFoundError:
         d = {"version": 1, "entries": []}
         try:
             save(d)
         except Exception:
             pass
-        return d
-    except Exception:
-        pass
-    return {"version": 1, "entries": []}
+        return _annotate(d)
+    except Exception as e:
+        # ⚠️ 损坏 ≠ 空表。**保留原文件**，把状态报出来，让调用方拒绝写入 ——
+        #    否则下一次 add/remove 会把空表覆盖上去，用户的已知项就全没了。
+        return _annotate({"version": 1, "entries": [], "_corrupt": repr(e)})
+
+
+def _annotate(d: dict) -> dict:
+    """把「已停用」的条目单列出来，供界面显示。
+
+    静默失效比报错更糟：用户会以为"我明明加过，怎么还在报"，
+    最后学会无视告警。所以停用必须**可见**。
+    """
+    legacy = [e for e in (d.get("entries") or [])
+              if (e.get("match") or {}).get("type") == "rule_only"]
+    if legacy:
+        d["_legacy_rule_only"] = legacy
+    return d
 
 
 def save(d: dict) -> None:
-    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
+    """原子写：先写临时文件 + fsync，再 os.replace 换名。
+
+    直接 open("w") 覆写时，读方可能读到**半截 JSON**（写了一半被读到）；
+    一旦它再把这份半截内容写回去，已知项就整份丢了。
+    os.replace 在同一卷上是原子的，读方永远只会看到"旧的全份"或"新的全份"。
+    """
+    tmp = WHITELIST_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, WHITELIST_FILE)
 
 
 def _subject_text(subject: dict) -> str:
@@ -122,13 +159,33 @@ def entry_matches(entry: dict, finding: dict, subject: dict) -> bool:
         if mv.lower() not in _subject_text(subject).lower():
             return False
     elif mt == "rule_only":
-        pass
+        # ⛔ 历史遗留条目：一律不生效（fail-closed）。
+        #
+        # 旧版允许它 = 一条 entry 关掉整条规则。红队实测（2/2）：只需
+        #   POST /api/whitelist/add {"rule_id":"P001",
+        #                            "match":{"type":"rule_only","value":""},"guard":{}}
+        # 就能让 P001 对**所有进程**永久失效 —— 替身进程照常运行，
+        # 但 P001 从告警里消失、等级从 critical 100 掉到 medium 42、
+        # 完整性仍显示 ok、时间线零告警。整个过程中用户完全无感。
+        #
+        # 为什么不留"兼容旧条目"：留着等于把洞留在数据里。
+        # 正确的做法是 fail-closed，并让 load() 把它单列出来，
+        # 界面显示「N 条旧格式已知项已停用」—— 可见，而不是静默失效。
+        return False
     else:
         return False
 
     # 守卫：文件必须存在且哈希一致，否则忽略失效（脚本被改动 → 告警回来）
     g = entry.get("guard") or {}
     if g.get("file"):
+        # F-018：加大小上限，且**超限视为"守卫不可用"→ 不放行豁免**（fail-closed）。
+        # 没有这道闸时，一条指向数 GB 文件的守卫会让每轮扫描（3 秒）
+        # 反复整文件哈希 —— 既是性能灾难，也让"守卫"形同虚设。
+        try:
+            if os.path.getsize(g["file"]) > _GUARD_MAX_BYTES:
+                return False
+        except Exception:
+            return False
         cur = _sha256(g["file"])
         if not cur or cur != g.get("sha256"):
             return False
@@ -191,7 +248,11 @@ def suggest(subject: dict, finding: dict) -> dict:
     elif exe:
         mt, mv = "exe_path", exe
     else:
-        mt, mv = "rule_only", ""
+        # 兜底**不再产出 rule_only**（那是按规则号全量豁免的后门）。
+        # 退到"对象名包含"，仍然限定到"这一个名字的对象"；
+        # 服务端还会断言这条条目只能命中一个对象，命中多个直接 400。
+        nm = str(subject.get("name") or subject.get("title") or "").strip()
+        mt, mv = ("subject_text_contains", nm) if nm else ("", "")
 
     return {
         "rule_id": finding.get("rule_id", ""),
@@ -204,7 +265,26 @@ def suggest(subject: dict, finding: dict) -> dict:
 
 def add(rule_id: str, match_type: str, match_value: str,
         guard_file: str = "", note: str = "") -> dict:
-    d = load()
+    """新增一条已知项。
+
+    ⚠️ 这里的校验是**纵深防御**，不是主防线（主防线在 server 的入参校验里）——
+    但只要 add() 是公开函数，就不能假设调用方一定校验过。
+    """
+    if match_type == "rule_only":
+        raise ValueError("不支持按规则号全量豁免——请给出限定到具体对象的匹配条件")
+    if match_type not in MATCH_TYPES:
+        raise ValueError(f"不支持的匹配方式：{match_type}")
+    if not (match_value or "").strip():
+        raise ValueError("匹配条件不能为空——空值会让该规则对所有对象失效")
+    with _LOCK:
+        d = load()
+        if d.get("_corrupt"):
+            raise ValueError("已知项文件损坏，已停止写入以免覆盖原内容：" + d["_corrupt"])
+        return _add_locked(d, rule_id, match_type, match_value, guard_file, note)
+
+
+def _add_locked(d: dict, rule_id: str, match_type: str, match_value: str,
+                guard_file: str, note: str) -> dict:
     eid = "wl-" + time.strftime("%Y%m%d-%H%M%S")
     entry = {
         "id": eid,
@@ -220,13 +300,16 @@ def add(rule_id: str, match_type: str, match_value: str,
 
 
 def remove(entry_id: str) -> bool:
-    d = load()
-    before = len(d.get("entries") or [])
-    d["entries"] = [e for e in (d.get("entries") or []) if e.get("id") != entry_id]
-    if len(d["entries"]) == before:
-        return False
-    save(d)
-    return True
+    with _LOCK:
+        d = load()
+        if d.get("_corrupt"):
+            raise ValueError("已知项文件损坏，已停止写入以免覆盖原内容：" + d["_corrupt"])
+        before = len(d.get("entries") or [])
+        d["entries"] = [e for e in (d.get("entries") or []) if e.get("id") != entry_id]
+        if len(d["entries"]) == before:
+            return False
+        save(d)
+        return True
 
 
 def listing() -> dict:
@@ -244,4 +327,7 @@ def listing() -> dict:
             "guard_ok": (not g.get("file")) or (bool(cur) and cur == g.get("sha256")),
             "guard_exists": bool(g.get("file")) and os.path.isfile(g["file"]),
         })
-    return {"file": WHITELIST_FILE, "match_types": MATCH_TYPES, "entries": out}
+    return {"file": WHITELIST_FILE, "match_types": MATCH_TYPES, "entries": out,
+            # 旧格式（rule_only）条目数：它们**已不生效**，但必须让界面显示出来。
+            # 静默失效比报错更糟 —— 用户会以为"我明明加过"，最后学会无视告警。
+            "legacy_rule_only": len(d.get("_legacy_rule_only") or [])}

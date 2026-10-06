@@ -35,7 +35,14 @@ _cmdline_cache: dict[tuple[int, int], list[str]] = {}
 # 只有 cmdline 会阻塞 —— 所以只跳过 cmdline，其它规则照常生效。
 PROTECTED_IMAGE_NAMES = {"lsaiso.exe", "ngciso.exe", "wudfcompanionhost.exe"}
 # 运行时学习：任何一次读取超时或失败的映像名都会被补进来（覆盖未知的受保护进程）
-_denied_names: set[str] = set(PROTECTED_IMAGE_NAMES)
+#
+# ⚠️ 必须带 TTL（红队 F-007）：原先这是个只增不减的 set，一次慢读就把映像名
+# **永久**拉黑 —— 此后 rundll32 / regsvr32 / mshta 这类宿主只要在 System32 下
+# 就直接跳过命令行，本会话内永久失明，且没有任何计数暴露。
+# 改成 name -> 解除时间(monotonic)，到期后重新尝试。
+_DENY_TTL = 600.0
+_denied_names: dict[str, float] = {n: float("inf") for n in PROTECTED_IMAGE_NAMES}
+_denied_this_round = 0
 
 _CACHE_LIMIT = 20000
 
@@ -210,7 +217,8 @@ def collect_processes(sig_cache: dict[str, dict] | None = None) -> list[dict]:
                 # 也没有路径可供其它规则使用 —— 直接跳过。
                 cmd = []
                 denied = True
-            elif lname in _denied_names and _in_system_dir(exe):
+            elif lname in _denied_names and \
+                    time.monotonic() < _denied_names[lname] and _in_system_dir(exe):
                 # 已知的受保护系统进程：直接跳过，不浪费那 1 秒
                 cmd = []
                 denied = True
@@ -227,8 +235,8 @@ def collect_processes(sig_cache: dict[str, dict] | None = None) -> list[dict]:
                     _cache_put(_cmdline_cache, key, cmd)
                     loaded = True
                 else:
-                    # 读不到、或单次耗时离谱 —— 记入名单，之后同名进程一律跳过
-                    _denied_names.add(lname)
+                    # 读不到、或单次耗时离谱 —— 记入名单（带 TTL），之后同名进程跳过
+                    _denied_names[lname] = time.monotonic() + _DENY_TTL
                     denied = True
             else:
                 cmd = []

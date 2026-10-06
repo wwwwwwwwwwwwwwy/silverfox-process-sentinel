@@ -49,17 +49,69 @@ HASH_LIMIT_MB = 64
 # 与基线文件不在同一目录，删除基线但不同时删哨兵 → 立即告警 baseline_lost。
 # 诚实边界：同权限攻击者知道哨兵位置后可以两个一起删 —— 用户态自校验
 # 无法防御针对性攻击，本机制防的是"顺手删基线"的普通恶意程序与意外丢失。
-SENTINEL_DIR = os.path.join(os.path.expandvars(r"%LOCALAPPDATA%"), "YinhuSentinel")
+# ⚠️ 不要用 os.path.expandvars：%LOCALAPPDATA% 未定义时它**原样留下字面量**，
+#    于是 SENTINEL_DIR 退化成相对 CWD 的路径 —— 哨兵整体失效（红队 F-016）。
+#    这里显式判断：拿不到绝对路径就退到家目录下的点目录。
+_lad = os.environ.get("LOCALAPPDATA")
+if _lad and os.path.isabs(_lad):
+    SENTINEL_DIR = os.path.join(_lad, "YinhuSentinel")
+else:
+    SENTINEL_DIR = os.path.join(os.path.expanduser("~"), ".YinhuSentinel")
 SENTINEL_FILE = "integrity.sentinel.json"
 
 
-def sentinel_path() -> str:
-    return os.path.join(SENTINEL_DIR, SENTINEL_FILE)
+def _install_tag(app_dir: str | None) -> str:
+    """把「程序目录」压成一个短标签，用于给基线/哨兵文件命名。
+
+    为什么需要它（红队 F-015）：基线原本是每用户单份文件、只能记一个 app_dir。
+    同机跑两份副本时，A 写完写 app_dir=A，B 启动发现"基线属于别的目录" →
+    当作首次运行 → 重建基线（app_dir=B）；A 再启动又被顶回去。
+    **交替运行 = 每次都是 first_run，changed 永远不出现。**
+    而本仓库自带的「本机副本管理」恰恰鼓励用户保留多份副本。
+
+    改成每份安装各有一个基线文件后，冲突从根上消失。
+    """
+    if not app_dir:
+        return "default"
+    key = os.path.normcase(os.path.abspath(app_dir)).encode("utf-8")
+    return hashlib.sha256(key).hexdigest()[:12]
 
 
-def load_sentinel() -> dict | None:
+def sentinel_path(app_dir: str | None = None) -> str:
+    return os.path.join(SENTINEL_DIR,
+                        f"integrity.sentinel.{_install_tag(app_dir)}.json")
+
+
+def sentinel_belongs_here(sent: dict | None, app_dir: str) -> bool:
+    """哨兵是否属于**本安装**。
+
+    判据**只看 app_dir（程序目录）**，不看数据目录。两条理由都是实测出来的：
+
+      · 数据目录是每用户的，同机多份副本共用它 —— 把它算进判据，
+        另一份副本会被误判成"本安装的基线被删"（假告警）；
+      · 数据目录本身会变（改 LOCALAPPDATA、%TEMP% 每会话不同）——
+        把它算进判据，**本安装**又会被误判成"别人的哨兵"，
+        于是走"首次运行、静默重建基线"（红队 F-016）——
+        这是往"不告警"的方向错，比假告警危险得多。
+
+    程序目录才是"这是哪一份安装"的稳定标识。
+
+    ⚠️ 抽成函数的原因：原先这段逻辑内联在 verify() 里，
+    而 _refresh_integrity_baseline() 完全没有 —— 于是"删基线 + 点一次加入已知项"
+    就能把基线静默重建、完整性告警永远不出现（红队 F-002，实测 2/2）。
+    两份实现必然漂移，所以只留一份。
+    """
+    if not sent:
+        return False
+    a = str(sent.get("app_dir") or "")
+    if not a:
+        return False
+    return os.path.normcase(a) == os.path.normcase(os.path.abspath(app_dir))
+
+
+def load_sentinel(app_dir: str | None = None) -> dict | None:
     try:
-        with open(sentinel_path(), "r", encoding="utf-8") as f:
+        with open(sentinel_path(app_dir), "r", encoding="utf-8") as f:
             d = json.load(f)
         if isinstance(d, dict):
             return d
@@ -77,7 +129,7 @@ def save_sentinel(workspace: str, manifest: dict, app_dir: str | None = None) ->
              # 只比 workspace 的话，另一份副本会被判成"基线被人删除"。
              "app_dir": os.path.abspath(app_dir) if app_dir else "",
              "count": len(manifest)}
-        with open(sentinel_path(), "w", encoding="utf-8") as f:
+        with open(sentinel_path(app_dir), "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=1)
     except Exception:
         pass
@@ -96,6 +148,44 @@ def _sha256(path: str) -> str:
         return ""
 
 
+def default_extras() -> list[str]:
+    """完整性覆盖范围的**唯一**来源 —— 不允许调用方各自决定。
+
+    ## 为什么必须收敛到一处
+
+    原先三处调用点各写一份，其中两处漏掉了 python_path.txt 与 whitelist.json：
+
+        · server.py 运行期 _integrity_extras()   → 完整（含 python_path.txt）
+        · main.py   --verify-only                → 只有 sys.executable（漏）
+        · server.py accept_integrity()           → 只有 sys.executable（漏）
+
+    后果是**健康安装上 `--verify-only` 也报「程序文件已被改动」并 exit 2**
+    （实测：`缺失：python_path.txt、whitelist.json`），而重建基线用的又是弱清单 ——
+    怎么点都消不掉。这条 critical 告警一旦常态化误报，用户就会学会无视它，
+    等于把整个完整性自检废掉。任何"启动自检门"在此之前都不能启用（启用即锁死）。
+
+    收敛之后：调用方只负责调用，覆盖范围只有这里一处定义。
+    """
+    import paths                      # 局部导入，避免与 server 的循环依赖
+    extra: list[str] = []
+    if getattr(sys, "frozen", False):
+        extra.append(sys.executable)
+    for p in (paths.PYTHON_PATH_FILE, paths.WHITELIST_FILE):
+        if os.path.isfile(p):
+            extra.append(p)
+    # F-014：启动链上真正决定"执行什么"的东西原先**不在覆盖范围内** ——
+    #   启动银狐监视器.bat（它 start 解释器）与 runtime\pythonw.exe。
+    #   改一个 .bat 的字节就能劫持启动，而自检完全无感。
+    #   作者已经把 python_path.txt 纳进来了（理由正是"启动器会执行它写的解释器"），
+    #   同一逻辑要贯彻到启动器本身。
+    import glob
+    for pattern in (os.path.join(paths.PROGRAM_DIR, "*.bat"),
+                    os.path.join(paths.PROGRAM_DIR, "*.py"),
+                    os.path.join(paths.PROGRAM_DIR, "runtime", "pythonw.exe")):
+        extra.extend(sorted(f for f in glob.glob(pattern) if os.path.isfile(f)))
+    return extra
+
+
 def collect_manifest(app_dir: str, extra_files: list[str] | None = None) -> dict:
     """计算 {相对路径: sha256}。相对 app 目录，避免因安装位置不同而误报。"""
     manifest: dict[str, str] = {}
@@ -110,22 +200,33 @@ def collect_manifest(app_dir: str, extra_files: list[str] | None = None) -> dict
             manifest[rel] = _sha256(p)
     for p in (extra_files or []):
         if p and os.path.isfile(p):
-            manifest[os.path.basename(p)] = _sha256(p)
+            # ⚠️ 键要带 <root>/ 前缀：否则 app/ 下若出现同名文件（例如
+            #    app/README.md 与根目录 README.md）会在字典里互相覆盖，
+            #    覆盖掉的那一个就**悄悄不再被校验**了。
+            manifest["<root>/" + os.path.basename(p)] = _sha256(p)
     return manifest
 
 
-def baseline_path(workspace: str) -> str:
-    return os.path.join(workspace, BASELINE_FILE)
+def baseline_path(workspace: str, app_dir: str | None = None) -> str:
+    """基线文件路径 —— **每份安装一个**（见 _install_tag 的说明）。"""
+    if app_dir is None:
+        return os.path.join(workspace, BASELINE_FILE)
+    return os.path.join(workspace, f"integrity.baseline.{_install_tag(app_dir)}.json")
 
 
-def load_baseline(workspace: str) -> dict | None:
-    try:
-        with open(baseline_path(workspace), "r", encoding="utf-8") as f:
-            d = json.load(f)
-        if isinstance(d, dict) and isinstance(d.get("files"), dict):
-            return d
-    except Exception:
-        pass
+def load_baseline(workspace: str, app_dir: str | None = None) -> dict | None:
+    """读本安装的基线；找不到再退到无后缀的旧文件名（一次性迁移）。"""
+    cands = [baseline_path(workspace, app_dir)]
+    if app_dir is not None:
+        cands.append(baseline_path(workspace, None))   # 旧命名，兼容迁移
+    for p in cands:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and isinstance(d.get("files"), dict):
+                return d
+        except Exception:
+            continue
     return None
 
 
@@ -139,7 +240,7 @@ def save_baseline(workspace: str, manifest: dict, note: str = "",
         "app_dir": os.path.abspath(app_dir) if app_dir else "",
         "files": manifest,
     }
-    with open(baseline_path(workspace), "w", encoding="utf-8") as f:
+    with open(baseline_path(workspace, app_dir), "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=1)
     return d
 
@@ -154,21 +255,14 @@ def verify(app_dir: str, workspace: str, extra_files: list[str] | None = None) -
       baseline_lost  —— 基线文件消失但哨兵还在（**需警惕**，可能被人删除）
     """
     cur = collect_manifest(app_dir, extra_files)
-    base = load_baseline(workspace)
-    # 基线属于另一个程序目录（同机多份副本共用数据目录）→ 按首次运行处理，
-    # 否则另一份副本会看到满屏"文件已被改动"的假告警。
-    if base and base.get("app_dir") and \
-            os.path.normcase(base["app_dir"]) != os.path.normcase(os.path.abspath(app_dir)):
-        base = None
+    # 基线按安装分文件（F-015）——"属于别的程序目录"那种冲突从命名上就不存在了，
+    # 所以原先那段"app_dir 对不上就当首次运行"的逻辑整段删掉。
+    base = load_baseline(workspace, app_dir)
     if not base:
-        sent = load_sentinel()
-        # 哨兵只对"同一安装位置"有效：文件夹整体被拷贝到新位置时
-        # 视为全新安装，正常建立基线，而不是误报基线丢失。
-        sent_here = bool(sent) and sent.get("workspace") == os.path.abspath(workspace)
-        if sent_here and sent.get("app_dir") and \
-                os.path.normcase(sent["app_dir"]) != os.path.normcase(os.path.abspath(app_dir)):
-            sent_here = False      # 哨兵属于另一个程序目录（同机多份副本）
-        if sent_here:
+        sent = load_sentinel(app_dir)
+        # 归属判断走公共函数（唯一口径）—— 同一安装换了数据目录仍算"本安装"，
+        # 所以这里会判成基线丢失（告警），而不是静默重建。
+        if sentinel_belongs_here(sent, app_dir):
             # 加固：基线没了但哨兵还在 → 基线被人删除或损坏，告警而不是重建
             return {
                 "status": "baseline_lost",
@@ -194,17 +288,33 @@ def verify(app_dir: str, workspace: str, extra_files: list[str] | None = None) -
     added = sorted(k for k in cur if k not in old)
     removed = sorted(k for k in old if k not in cur)
 
-    status = "changed" if (changed or added or removed) else "ok"
+    # F-016：用哨兵里的 count 做一次廉价交叉校验。
+    # 哨兵是我们自己写的、记录"当时算出来几个文件"。若基线里的文件数
+    # 与哨兵记录的对不上，说明这份基线**不是我们写的那一份**（被整份换过）——
+    # 即使逐文件比对看起来"一致"，也应当警惕。
+    # count 字段原先写进去却从没被读过，这是最廉价的一个信号，不该浪费。
+    sent = load_sentinel(app_dir)
+    count_mismatch = False
+    if sentinel_belongs_here(sent, app_dir):
+        n = sent.get("count")
+        if isinstance(n, int) and n > 0 and len(old) != n:
+            count_mismatch = True
+
+    status = "changed" if (changed or added or removed or count_mismatch) else "ok"
+    zh = {
+        "ok": "文件完整性正常",
+        "changed": "⚠️ 程序文件已被改动",
+    }[status]
+    if count_mismatch:
+        zh = f"⚠️ 基线文件数与记录不符（记录 {sent.get('count')} / 实际 {len(old)}）"
     return {
         "status": status,
-        "status_zh": {
-            "ok": "文件完整性正常",
-            "changed": "⚠️ 程序文件已被改动",
-        }[status],
+        "status_zh": zh,
         "checked": len(cur),
         "changed": changed[:20],
         "added": added[:20],
         "removed": removed[:20],
+        "count_mismatch": count_mismatch,
         "baseline_time": base.get("created", ""),
         "ts": time.time(),
     }
@@ -221,10 +331,8 @@ def main():
     # 不能再按"程序目录的上一级"去猜。
     import paths
     workspace = paths.DATA_DIR
-    extra = [sys.executable] if getattr(sys, "frozen", False) else []
-    for p in (paths.PYTHON_PATH_FILE, paths.WHITELIST_FILE):
-        if os.path.isfile(p):
-            extra.append(p)
+    # 覆盖范围唯一来源（原先这里是一份内联实现，与其它调用点不一致）
+    extra = default_extras()
     if "--accept" in sys.argv:
         m = collect_manifest(here, extra)
         save_baseline(workspace, m, app_dir=here, note="用户通过命令行重建基线")

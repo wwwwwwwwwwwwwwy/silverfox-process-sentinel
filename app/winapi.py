@@ -516,14 +516,50 @@ try {
   $out.suspicious_reg = @($hits)
 } catch { $out.suspicious_reg = @() }
 
-ConvertTo-Json -InputObject $out -Compress -Depth 6
+# ⚠️ 分节输出，而不是最后一次性输出整个对象。
+#    合并调用是为了性能（5 个进程 → 1 个），但"只在末尾输出一次"意味着
+#    任一小节挂起、脚本被超时 kill 时，stdout 为空 → 五类制品同时归零，
+#    而界面与报告只会显示"未发现异常"。
+#    分节之后，已经跑完的节照样能拿到，缺的节由 Python 侧标成"未取到"。
+function Emit([string]$name, $obj) {
+  Write-Output ("##SEC " + $name)
+  Write-Output (ConvertTo-Json -InputObject $obj -Compress -Depth 6)
+}
+Emit 'tasks'          @($out.tasks)
+Emit 'drivers'        @($out.drivers)
+Emit 'run_keys'       @($out.run_keys)
+Emit 'defender'       $out.defender
+Emit 'suspicious_reg' @($out.suspicious_reg)
 """
-    data = run_ps_json(script, timeout=timeout)
+    # 逐节解析：节头形如 `##SEC tasks`，下一行是该节的压缩 JSON。
+    # 缺的节记进 _unavailable —— 让"没查到"和"没取到"分得开。
+    _raw = run_ps(script, timeout=timeout)
+    data, missing = {}, []
+    _lines = (_raw or "").splitlines()
+    _i = 0
+    while _i < len(_lines):
+        if _lines[_i].startswith("##SEC "):
+            _name = _lines[_i][6:].strip()
+            if _i + 1 < len(_lines):
+                try:
+                    data[_name] = json.loads(_lines[_i + 1])
+                except Exception:
+                    missing.append(_name)
+            else:
+                missing.append(_name)      # 有节头无内容 → 多半是超时被杀
+            _i += 2
+            continue
+        _i += 1
+    if not data and not missing:
+        data = None                        # 完全没输出（进程起不来等）
     empty = {"tasks": [], "drivers": [], "run_keys": [],
              "defender": {"accessible": False, "paths": [], "processes": [],
                           "extensions": []},
              "suspicious_reg": []}
     if not isinstance(data, dict):
+        # 完全没取到：把五类都标成"未取到"，而不是让上层以为"查过了、没异常"。
+        empty["_unavailable"] = ["tasks", "drivers", "run_keys",
+                                 "defender", "suspicious_reg"]
         return empty
 
     def _lst(v):
@@ -579,7 +615,10 @@ ConvertTo-Json -InputObject $out -Compress -Depth 6
                                 for v in _lst(h.get("values")) if isinstance(v, dict)]})
 
     return {"tasks": tasks, "drivers": drivers, "run_keys": run_keys,
-            "defender": defender, "suspicious_reg": susp}
+            "defender": defender, "suspicious_reg": susp,
+            # F-008：本次**没取到**的小节。上层必须把它显示出来 ——
+            # "没查到"与"没取到"混在一起，对反木马工具就是假阴性。
+            "_unavailable": sorted(set(missing))}
 
 
 def get_scheduled_tasks() -> list[dict]:
@@ -775,15 +814,33 @@ def read_hosts() -> list[dict]:
     path = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                         "System32", "drivers", "etc", "hosts")
     entries = []
+    # F-012：先嗅探 BOM 再决定编码。
+    # 旧写法用 `utf-8 + errors="replace"` 读 —— 它**永不抛错**，
+    # 于是后面那个 gbk 回退是死代码；而 UTF-16 的 hosts 会被整行丢成乱码，
+    # H 系列（hosts 劫持）静默漏报。以二进制读入、显式解码才能救回来。
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        with open(path, "rb") as f:
+            raw = f.read()
     except Exception:
-        try:
-            with open(path, "r", encoding="gbk", errors="replace") as f:
-                lines = f.readlines()
-        except Exception:
-            return []
+        return []
+    # ⚠️ 必须按**签名**判断编码，不能"逐个编码试解" ——
+    #    utf-16 解码很宽容：一段 GBK 字节也能"解成功"，产出的是乱码而不是异常，
+    #    于是回退链根本轮不到 gbk，hosts 被整片解成乱码（实测踩过）。
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        enc = "utf-16"                       # 有 BOM，字节序由 BOM 决定
+    elif raw[:3] == b"\xef\xbb\xbf":
+        enc = "utf-8-sig"
+    elif raw.count(b"\x00") > max(2, len(raw) * 0.25):
+        # 无 BOM 但大量 NUL → UTF-16；按首字节判断字节序
+        enc = "utf-16-be" if raw[:1] == b"\x00" else "utf-16-le"
+    else:
+        enc = "utf-8"
+    try:
+        text = raw.decode(enc)
+    except Exception:
+        # UTF-8 解不动 → 中文 Windows 上的 hosts 多半是 GBK
+        text = raw.decode("gbk", errors="replace")
+    lines = text.splitlines(keepends=True)
     for ln in lines:
         s = ln.strip()
         if not s or s.startswith("#"):

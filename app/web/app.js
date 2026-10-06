@@ -136,6 +136,11 @@ const LANGS = {
     wl_title: '已知项（不再告警的条目）',
     wl_none: '暂无。在告警详情里点「标记为已知项」即可添加。',
     wl_note: '每条已知项都绑定<b>被执行文件的哈希</b>：文件一旦被改动，忽略立即失效、告警自动回来。因此它不会成为攻击者的"免死金牌"。',
+    wl_legacy: '有 {n} 条旧格式已知项已停用 —— 旧格式是「按规则号全量豁免」，'
+             + '一条就能把整条规则对所有对象关掉，属于后门，已不再生效。请按新格式重建需要的那几条。',
+    wl_remove_title: '移除已知项',
+    wl_remove_body: '移除后，该条告警会重新出现。确定吗？',
+    wl_remove_ok: '移除',
 
     sig_checking: '校验中', sig_ok: '签名有效', sig_forged: '签名伪造',
     sig_untrusted: '根证书不受信任', sig_noimage: '无镜像文件',
@@ -306,6 +311,11 @@ const LANGS = {
     wl_title: '白名单（不再提醒的东西）',
     wl_none: '还没有。在问题详情里点「加入白名单」就能添加。',
     wl_note: '每条白名单都记着那个文件的<b>指纹</b>：文件只要被改过（哪怕一个字节），这条忽略就立刻失效、提醒会自己回来。所以它不会变成坏人的"免死金牌"。',
+    wl_legacy: '有 {n} 条旧格式白名单已停用 —— 旧格式是「整条规则一起忽略」，'
+             + '一条就能把这条规则对**所有程序**都关掉，等于后门，现在不再生效。需要的话请按新格式重新加。',
+    wl_remove_title: '移除这条白名单',
+    wl_remove_body: '移除后，这条提醒会重新出现。确定吗？',
+    wl_remove_ok: '移除',
 
     sig_checking: '正在验签名', sig_ok: '签名正常', sig_forged: '签名是假的',
     sig_untrusted: '签名来路不明', sig_noimage: '没有可执行文件',
@@ -357,7 +367,13 @@ const LANGS = {
   },
 };
 
-let LANG = localStorage.getItem('yinhu-lang') || 'plain';
+// ⚠️ 必须包 try：存储被禁用时（隐私模式 / 组策略）localStorage 会**抛异常**，
+//    而这是顶层代码 —— 一抛就整个脚本停止求值，界面永远停在静态 HTML 上，
+//    没有任何报错可看（红队 F-009）。同文件后面的 setItem 早就包了，这处属漏改。
+let LANG = 'plain';
+try {
+  LANG = localStorage.getItem('yinhu-lang') || 'plain';
+} catch (e) { /* 存储不可用 → 用默认值，不影响其它功能 */ }
 if (!LANGS[LANG]) LANG = 'plain';
 
 function T(k) {
@@ -1229,10 +1245,13 @@ function renderSecurity() {
   const wl = STATE.whitelist || { entries: [] };
   const ent = wl.entries || [];
   const badGuard = ent.filter((e) => !e.guard_ok).length;
+  const legacy = Number(wl.legacy_rule_only || 0);
   const wlCard = `
-    <div class="seccard ${badGuard ? 'warn' : ''}">
+    <div class="seccard ${badGuard || legacy ? 'warn' : ''}">
       <h5>${esc(T('wl_title'))}</h5>
-      <div class="big">${ent.length} 条${badGuard ? ` · ${badGuard} 条守卫失效` : ''}</div>
+      <div class="big">${ent.length} 条${badGuard ? ` · ${badGuard} 条守卫失效` : ''}${
+        legacy ? ` · ${legacy} 条已停用` : ''}</div>
+      ${legacy ? `<div class="sub" style="color:var(--high)">⚠ ${Tn('wl_legacy', { n: legacy })}</div>` : ''}
       ${ent.length ? `<div class="sub">${
         ent.map((e) => `<div class="wlrow">
             <code>${esc(e.rule_id)}</code> ${esc(e.match.type)}:${esc((e.match.value || '').slice(0, 34))}
@@ -1246,20 +1265,10 @@ function renderSecurity() {
       <div class="sub" style="margin-top:8px">${T('wl_note')}</div>
     </div>`;
 
-  $$('#secBox [data-wlrm]').forEach((el) => {
-    el.addEventListener('click', async (ev) => {
-      ev.stopPropagation();
-      const ok = await confirmBox({
-        title: '移除已知项',
-        body: '<p>移除后，该条告警会重新出现。确定吗？</p>',
-        okText: '移除',
-      });
-      if (!ok) return;
-      const r = await api('/api/whitelist/remove', { id: el.dataset.wlrm });
-      toast(r.msg, r.ok ? 'ok' : 'err');
-      await refreshWhitelist();
-    });
-  });
+  // ⚠️ 「移除已知项」的监听**不在这里绑** —— 见 DOMContentLoaded 里的委托绑定。
+  //    原先这里对 [data-wlrm] 逐个 addEventListener，但紧随其后就
+  //    `$('#secBox').innerHTML = ...` 换掉了整片节点，监听器随旧节点一起被丢弃，
+  //    按钮点了没反应（红队 F-010）。委托给不动的 #secBox 才不受重绘影响。
 
   $('#secBox').innerHTML = `
     <div class="seccard ${itCls}">
@@ -1550,6 +1559,23 @@ document.addEventListener('DOMContentLoaded', () => {
     setLang(b.dataset.lang);
   }));
 
+  // 「移除已知项」—— 委托给 #secBox（它在整个会话里不被替换）。
+  // 卡片内容是每次 renderSecurity() 重新生成的，逐个绑监听必然被丢掉。
+  $('#secBox').addEventListener('click', async (ev) => {
+    const el = ev.target.closest('[data-wlrm]');
+    if (!el) return;
+    ev.stopPropagation();
+    const ok = await confirmBox({
+      title: T('wl_remove_title'),
+      body: `<p>${esc(T('wl_remove_body'))}</p>`,
+      okText: T('wl_remove_ok'),
+    });
+    if (!ok) return;
+    const r = await api('/api/whitelist/remove', { id: el.dataset.wlrm });
+    toast(r.msg, r.ok ? 'ok' : 'err');
+    await refreshWhitelist();
+  });
+
   $$('.tab').forEach((t) => t.addEventListener('click', () => {
     $$('.tab').forEach((x) => x.classList.remove('active'));
     $$('.tabpane').forEach((x) => x.classList.remove('active'));
@@ -1707,7 +1733,10 @@ document.addEventListener('DOMContentLoaded', () => {
       });
       if (note === null) return;
       const r = await api('/api/whitelist/add', {
+        // ⚠️ 必须带 pid：服务端要据此断言"这条已知项只命中这一个对象"，
+        //    否则一条宽条件就能把某条规则对所有对象关掉（红队 F-001）。
         rule_id: sg.rule_id, match: sg.match, guard: sg.guard, note,
+        pid,
       });
       toast(r.msg, r.ok ? 'ok' : 'err');
       await refreshWhitelist();

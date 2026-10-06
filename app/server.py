@@ -119,6 +119,10 @@ class Monitor:
         self.artifacts: dict = {}
         self.artifact_findings: list[dict] = []
         self.sig_cache: dict[str, dict] = {}
+        # F-006：签名校验的连续失败次数（path -> 次数）。
+        # 失败结果**不进 sig_cache**（否则本会话永不重试），改用这个可恢复的计数：
+        # 3 次以内下一轮自动重试，超过后不再重试但会在界面上显示出来。
+        self._sig_failed: dict[str, int] = {}
         self.pending_sig: set[str] = set()
         self.deep_done: set[tuple] = set()
         self._deep_retry: dict[tuple, int] = {}   # 深度扫描"等签名结果"的重试计数
@@ -197,11 +201,28 @@ class Monitor:
         """
         try:
             cur = integrity.collect_manifest(APP_DIR, self._integrity_extras())
-            base = integrity.load_baseline(WORKSPACE)
+            # 基线按安装分文件（F-015），所以这里不再需要"属于别的程序目录就丢弃"
+            # 那套逻辑 —— 冲突从命名上就不存在了。
+            base = integrity.load_baseline(WORKSPACE, APP_DIR)
             if not base:
-                # 没有基线（首次运行）→ 正常建立
+                # 基线不存在 = 两种可能，**必须区分**：
+                #   · 首次运行      → 正常建立
+                #   · 基线被人删除  → 告警，**绝不重建**
+                # 重建等于替攻击者抹痕：他只需删掉基线文件，然后等用户对
+                # 任何一条**无关**告警点一次"加入已知项"，篡改就被写进新基线、
+                # 完整性告警从此永远不出现 —— 触发动作完全日常，用户毫不知情。
+                # （红队 F-002，实测 2/2；这恰是 integrity.py 注释里声称已堵住的那条路。）
+                if integrity.sentinel_belongs_here(
+                        integrity.load_sentinel(APP_DIR), APP_DIR):
+                    self._integrity_alerted = False   # 让下一轮 check_integrity 重新告警
+                    self.check_integrity()
+                    # 返回非空 → 端点回 integrity_refresh="blocked" → 界面明示
+                    # "已加入已知项，但基线刷新被拒绝"。刻意让用户知道
+                    # "你刚才那个动作没能洗掉告警"。
+                    return ["（完整性基线丢失，已拒绝刷新基线）"]
                 integrity.save_baseline(WORKSPACE, cur, app_dir=APP_DIR,
-                                            note="界面修改已知项后自动刷新")
+                                            note="首次运行建立基线")
+                integrity.save_sentinel(WORKSPACE, cur, APP_DIR)
                 self._integrity_alerted = False
                 self.check_integrity()
                 return None
@@ -228,22 +249,15 @@ class Monitor:
     def _integrity_extras() -> list[str]:
         """完整性校验要覆盖的「app/ 之外」的文件。
 
-        为什么必须包含 python_path.txt：启动器会执行它里面写的解释器路径，
-        而它原先不在基线覆盖范围内 —— 能写项目根目录的人改掉它，
-        用户下次双击启动器就执行了攻击者的程序（且监视器根本不会启动，
-        自检告警永远不出现）。把它纳入基线后，改动会触发「程序文件已被改动」。
+        ⚠️ **覆盖范围不在这里决定** —— 一律走 integrity.default_extras()。
+        这里保留成薄封装只是因为历史上被多处引用。
+
+        原先这里是一份内联实现，而 main.py --verify-only 与 accept_integrity
+        各写了另一份（都漏了 python_path.txt / whitelist.json）——
+        结果是**健康安装上 --verify-only 也报「程序文件已被改动」并 exit 2**，
+        而且重建基线用的弱清单怎么点都消不掉。详见 integrity.default_extras()。
         """
-        extra: list[str] = []
-        if getattr(sys, "frozen", False):
-            extra.append(sys.executable)
-        # 启动器会执行 python_path.txt 里写的解释器 —— 必须纳入基线，
-        # 否则改掉它就能让启动器执行攻击者的程序，且监视器根本不会启动。
-        if os.path.isfile(paths.PYTHON_PATH_FILE):
-            extra.append(paths.PYTHON_PATH_FILE)
-        # whitelist.json 移到了数据目录，不再被 app/ 遍历覆盖，需显式加入
-        if os.path.isfile(whitelist.WHITELIST_FILE):
-            extra.append(whitelist.WHITELIST_FILE)
-        return extra
+        return integrity.default_extras()
 
     def check_integrity(self):
         """校验程序自身文件是否被改动。结果会出现在界面的「安全状态」里。"""
@@ -257,29 +271,41 @@ class Monitor:
             if res.get("status") in ("changed", "baseline_lost") and \
                     not getattr(self, "_integrity_alerted", False):
                 self._integrity_alerted = True
-                self.alerts.insert(0, {
-                    "time": time.strftime("%H:%M:%S"),
-                    "ts": time.time(),
-                    "level": "critical",
-                    "score": 100,
-                    "name": "本程序文件完整性异常",
-                    "pid": 0,
-                    "exe": "、".join((res.get("changed") or [])[:3])
-                           or (res.get("status_zh") or "见安全状态"),
-                    "rules": [{"id": "SELF", "title": "程序文件已被改动/基线丢失",
-                               "severity": "critical",
-                               "evidence": "被修改：" + "、".join(res.get("changed") or [])
-                                           + "\n新增：" + "、".join(res.get("added") or [])
-                                           + "\n缺失：" + "、".join(res.get("removed") or [])
-                                           + ("\n基线状态：" + res.get("status_zh", "")
-                                              if res.get("status") == "baseline_lost" else "")}],
-                    "text": "本程序文件与首次运行时的基线不一致，检测规则可能已被篡改",
-                })
-                del self.alerts[200:]
+                # ⚠️ 去重：时间线里已经有同类（SELF）告警就不再插。
+                # 为什么必须去重：_refresh_integrity_baseline 在"基线丢失 +
+                # 用户点加入已知项"时会复位 _integrity_alerted 并重新校验
+                # （否则那一瞬间删掉基线就永远不会告警）。但如果没有这道去重，
+                # 反复点"加入已知项"就会把时间线刷满同类告警 ——
+                # **刷屏本身就是一种掩盖手段**，会把别的告警挤出去。
+                _dup = any((a.get("rules") or [{}])[0].get("id") == "SELF"
+                           for a in self.alerts)
+                if not _dup:
+                    self.alerts.insert(0, {
+                        "time": time.strftime("%H:%M:%S"),
+                        "ts": time.time(),
+                        "level": "critical",
+                        "score": 100,
+                        "name": "本程序文件完整性异常",
+                        "pid": 0,
+                        "exe": "、".join((res.get("changed") or [])[:3])
+                               or (res.get("status_zh") or "见安全状态"),
+                        "rules": [{
+                            "id": "SELF", "title": "程序文件已被改动/基线丢失",
+                            "severity": "critical",
+                            "evidence": "被修改：" + "、".join(res.get("changed") or [])
+                                        + "\n新增：" + "、".join(res.get("added") or [])
+                                        + "\n缺失：" + "、".join(res.get("removed") or [])
+                                        + ("\n基线状态：" + res.get("status_zh", "")
+                                           if res.get("status") == "baseline_lost" else "")}],
+                        "text": "本程序文件与首次运行时的基线不一致，检测规则可能已被篡改",
+                    })
+                    del self.alerts[200:]
 
     def accept_integrity(self):
         """用户确认改动是自己做的 → 重建基线。"""
-        extra = [sys.executable] if getattr(sys, "frozen", False) else []
+        # ⚠️ 与运行期、--verify-only 用同一份覆盖范围，否则重建出来的基线
+        #    与运行期比对口径不一致 → 告警消不掉（实测过）
+        extra = integrity.default_extras()
         m = integrity.collect_manifest(APP_DIR, extra)
         integrity.save_baseline(WORKSPACE, m, app_dir=APP_DIR,
                                         note="用户从界面确认并重建")
@@ -562,10 +588,17 @@ class Monitor:
                     self.sig_cache.update(res)
                     for p in batch:
                         if p.lower() not in self.sig_cache:
-                            self.sig_cache[p.lower()] = {
-                                "status": "UnknownError", "status_zh": "校验失败",
-                                "kind": "unknown", "signer": "", "cn": "", "notafter": "",
-                            }
+                            # ⚠️ 失败结果**不写进 sig_cache**，只累加失败计数。
+                            # 旧写法把失败固化成 kind="unknown" 缓存起来，而重新入队的
+                            # 条件是 `exe not in sig_cache` → 本会话永不重试；
+                            # 且 rules.UNTRUSTED_KINDS 不含 unknown → 所有签名门控规则
+                            # 对这些文件长期跳过。一次瞬时故障 = 永久盲区（红队 F-006）。
+                            # 改成可恢复：失败 3 次内自动重试，超过后不再重试但**计数可见**。
+                            k = p.lower()
+                            self._sig_failed[k] = self._sig_failed.get(k, 0) + 1
+                    for p in batch:
+                        if p.lower() in self.sig_cache:
+                            self._sig_failed.pop(p.lower(), None)
                     self._score_all()
                     if self.artifacts:
                         self._score_artifacts()
@@ -602,6 +635,10 @@ class Monitor:
                     "services": len(art.get("services", [])),
                     "drivers": len(art.get("drivers", [])),
                     "hosts_entries": len(art.get("hosts", [])),
+                    # F-008：本次**没取到**的制品小节。
+                    # 必须让"没查到"与"没取到"分得开 —— 否则报告与界面显示
+                    # "未发现异常"，而实际上那几类根本没采集到，属假阴性。
+                    "artifact_unavailable": list(art.get("_unavailable") or []),
                     "scan_ms": self.scan_ms,
                     "scan_count": self.scan_count,
                     "last_scan": self.last_scan,
@@ -609,6 +646,13 @@ class Monitor:
                     "admin": winapi.is_admin(),
                     "status": self.status,
                     "sig_pending": len(self.pending_sig),
+                    # F-006：签名校验已重试到上限、不再重试的文件数。
+                    # 让"坏了"不再看起来像"正忙" —— 否则用户只会看到 sig_pending 一直不为 0。
+                    "sig_failed": sum(1 for v in self._sig_failed.values() if v >= 3),
+                    # F-007：本轮有多少进程因**历史慢读**被跳过命令行。
+                    # 这个数原先根本不存在，导致"命令行类规则对本会话失明"完全不可见。
+                    "cmdline_denied": sum(1 for p in self.procs
+                                          if p.get("cmdline_denied")),
                     "artifact_busy": self.artifact_busy,
                     "sig_busy": self.sig_busy,
                     "defender_accessible": bool((art.get("defender") or {}).get("accessible")),
@@ -628,6 +672,11 @@ class Monitor:
                     "ioc_version": iocs.IOC_VERSION,
                     "ioc_sources": iocs.IOC_SOURCES,
                     "rule_count": len(_RULE_DOC),
+                    # 数据目录若退到程序目录（用户可写），基线就落在能被改写的位置，
+                    # 自检形同虚设 —— 必须让界面看得见，而不是静默降级。
+                    "data_dir": paths.DATA_DIR,
+                    "data_on_program_dir": bool(
+                        paths.describe().get("on_program_dir")),
                     # 版本号必须下发到界面：本机存在多份副本时，
                     # "我看到的是哪一版"是排查一切问题的第一步。
                     "app_version": version.VERSION,
@@ -761,6 +810,34 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
+    def _guard_origin_host(self) -> bool:
+        """**与方法无关**的来源校验：Origin 同源 + Host 回环（防 DNS 重绑定）。
+
+        ⚠️ 这里**不检查令牌**。GET 是界面每 2 秒轮询（/api/state）与启动器探测
+        （main.find_running_instance / _open_when_ready，都是裸 urllib）在用的 ——
+        给 GET 加令牌这两条会全部 403，界面直接停摆。
+        GET 要的是"数据别被别的站点读走"，令牌层对同用户进程本来也不构成屏障。
+
+        ⚠️ Host 切分必须正确处理 IPv6：`[::1]:8787` 按 split(":")[0] 会切成 "[",
+        再 strip("[]") 变成空串 → 校验被整个跳过（红队 F-005 指出的旧写法）。
+        """
+        origin = self.headers.get("Origin")
+        if origin:
+            if urlparse(origin).hostname not in ALLOWED_HOSTS:
+                self._json({"ok": False, "msg": "拒绝：请求来源不被允许"}, 403)
+                return False
+        h = (self.headers.get("Host") or "").strip()
+        if h.startswith("["):                       # [::1]:8787
+            host = h.split("]")[0].lstrip("[").lower()
+        elif h.count(":") == 1:                     # 127.0.0.1:8787
+            host = h.rsplit(":", 1)[0].lower()
+        else:                                       # 裸主机名或畸形值
+            host = h.lower()
+        if host and host not in ALLOWED_HOSTS:
+            self._json({"ok": False, "msg": "拒绝：Host 不被允许"}, 403)
+            return False
+        return True
+
     def _guard(self) -> bool:
         """POST 请求的四层来源校验。任一层不过直接 403。"""
         # compare_digest 对含非 ASCII 的字符串抛 TypeError。
@@ -773,15 +850,7 @@ class Handler(BaseHTTPRequestHandler):
         if not token_ok:
             self._json({"ok": False, "msg": "拒绝：访问令牌缺失或不正确"}, 403)
             return False
-        origin = self.headers.get("Origin")
-        if origin:
-            o = urlparse(origin)
-            if o.hostname not in ALLOWED_HOSTS:
-                self._json({"ok": False, "msg": "拒绝：请求来源不被允许"}, 403)
-                return False
-        host = (self.headers.get("Host") or "").split(":")[0].strip("[]")
-        if host and host not in ALLOWED_HOSTS:
-            self._json({"ok": False, "msg": "拒绝：Host 不被允许"}, 403)
+        if not self._guard_origin_host():
             return False
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/json":
@@ -791,6 +860,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------------- 路由 ----------------
     def do_GET(self):
+        # GET 也要过来源校验（Origin 同源 + Host 回环），但**不加令牌**。
+        # 不加之前：伪造 `Host: evil.example.com` 的 GET 全部 200，
+        # 一次 /api/state 就吐出进程清单 / 完整命令行 / 路径 / 哈希 / 白名单，
+        # 且 GET / 返回的 HTML 里会话令牌已被替换成真实值（红队 F-005，实测 2/2）。
+        if not self._guard_origin_host():
+            return
         u = urlparse(self.path)
         p = u.path
         q = parse_qs(u.query)
@@ -910,8 +985,10 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/whitelist/add":
             rid = str(body.get("rule_id") or "")
             m2 = body.get("match") or {}
-            mtype = str(m2.get("type") or "rule_only")
+            # ⚠️ 默认值**不能**回落到 rule_only —— 那等于"不写类型就全量豁免"
+            mtype = str(m2.get("type") or "")
             mvalue = str(m2.get("value") or "")
+            guard_file = str((body.get("guard") or {}).get("file") or "")
 
             # 入参校验：否则可以构造"全量豁免"条目 ——
             # 例如 exe_path_prefix + 空 value（"任意路径".startswith("") 恒真）
@@ -920,18 +997,69 @@ class Handler(BaseHTTPRequestHandler):
             if rid not in known_rules:
                 self._json({"ok": False, "msg": f"未知规则号：{rid or '(空)'}"}, 400)
                 return
+            # ① 禁止「按规则号全量豁免」——这是把一条规则对所有对象关掉的后门
+            if mtype == "rule_only":
+                self._json({"ok": False,
+                            "msg": "不支持按规则号全量豁免：请给出限定到具体对象的匹配条件"},
+                           400)
+                return
             if mtype not in whitelist.MATCH_TYPES:
                 self._json({"ok": False,
-                            "msg": f"不支持的匹配方式：{mtype}"}, 400)
+                            "msg": f"不支持的匹配方式：{mtype or '(空)'}"}, 400)
                 return
-            if mtype != "rule_only" and not mvalue.strip():
+            # ② 所有类型都必须给非空匹配值（空值会让 "" in x / startswith("") 恒真）
+            if not mvalue.strip():
                 self._json({"ok": False,
                             "msg": "匹配条件不能为空——空值会让该规则对所有对象失效"}, 400)
                 return
+            # ③ 必须指明对象，并断言「这条条目只命中这一个对象」。
+            #    这是**结构性**防线：即使前面几条被绕过，
+            #    一条会命中多个对象的条目也进不来，"一条 entry 关掉整条规则"
+            #    在数据层面不再可能。红队报告 §2.1.3 的推荐做法。
+            scope_pid = body.get("pid")
+            scope_aid = str(body.get("artifact_id") or "")
+            if scope_pid is None and not scope_aid:
+                self._json({"ok": False,
+                            "msg": "必须指明这条已知项针对哪个对象（pid 或 artifact_id）"},
+                           400)
+                return
+            cand = {"rule_id": rid,
+                    "match": {"type": mtype, "value": mvalue},
+                    "guard": {"file": guard_file,
+                              "sha256": whitelist._sha256(guard_file) if guard_file else ""}}
+            hits = []
+            for x in m.procs:
+                for f in x.get("findings", []):
+                    if whitelist.entry_matches(cand, f, x):
+                        hits.append(f"{x.get('name')}(pid {x.get('pid')})")
+            for a in m.artifact_findings:
+                for f in a.get("findings", []):
+                    if whitelist.entry_matches(cand, f, a):
+                        hits.append(f"{a.get('title')}({a.get('id')})")
+            if len(hits) > 1:
+                shown = "、".join(hits[:5]) + ("…" if len(hits) > 5 else "")
+                self._json({"ok": False,
+                            "msg": f"这条已知项会同时命中 {len(hits)} 个对象（{shown}）——"
+                                   f"请把匹配条件收窄到只针对你要忽略的那一个"}, 400)
+                return
 
-            e = whitelist.add(rid, mtype, mvalue,
-                              str((body.get("guard") or {}).get("file") or ""),
-                              str(body.get("note") or ""))
+            # ④ 匹配值还要"够具体"：非空不等于够窄 ——
+            #    exe_path_prefix + "C:\" 或 cmdline_contains + "a" 依然一网打尽。
+            #    放在对象断言之后：先告诉用户"要限定到哪个对象"，再说"值太宽"，
+            #    提示顺序才符合排查顺序。
+            broad = _match_too_broad(mtype, mvalue)
+            if broad:
+                self._json({"ok": False, "msg": broad}, 400)
+                return
+
+            try:
+                e = whitelist.add(rid, mtype, mvalue, guard_file,
+                                  str(body.get("note") or ""))
+            except ValueError as ex:
+                # 已知项文件损坏时拒绝写入 —— 否则会把空表覆盖上去，
+                # 用户的已知项全部永久丢失（红队 F-017）。
+                self._json({"ok": False, "msg": str(ex)}, 409)
+                return
             blocked = m._refresh_integrity_baseline()
             if blocked:
                 self._json({"ok": True, "entry": e, "integrity_refresh": "blocked",
@@ -942,7 +1070,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "entry": e,
                             "msg": "已加入已知项，该告警不再显示"})
         elif p == "/api/whitelist/remove":
-            ok = whitelist.remove(str(body.get("id") or ""))
+            try:
+                ok = whitelist.remove(str(body.get("id") or ""))
+            except ValueError as ex:
+                self._json({"ok": False, "msg": str(ex)}, 409)
+                return
             blocked = m._refresh_integrity_baseline()
             if blocked:
                 self._json({"ok": ok, "integrity_refresh": "blocked",
@@ -969,6 +1101,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "msg": f"已开始一轮 {netmon.fmt_duration(dur)} 的网络观测"})
             elif p == "/api/net/duration":
                 r = m.netmon.set_duration(dur)
+                # F-003：非法入参（非数字 / NaN / 无穷）明确回 400 ——
+                # 旧写法会把它静默钳成边界值并回"已改为 0.0 秒"，
+                # 说的和做的不一样，排查时最费时间。
+                if r.get("bad"):
+                    self._json({"ok": False, "msg": r.get("msg") or "观测时长不合法"}, 400)
+                    return
                 if r.get("finalized"):
                     msg = f"观测时长已改为 {netmon.fmt_duration(dur)}，已到时间，本轮结算完成"
                 elif r.get("restarted"):
@@ -1157,6 +1295,39 @@ def _flow_rules_text(f: dict) -> str:
     return f.get("verdict") or ""
 
 
+def _match_too_broad(mtype: str, value: str) -> str:
+    """匹配值是否宽到"一网打尽"。返回错误说明；够具体则返回空串。
+
+    ⚠️ 这是**启发式下限，不是安全边界**。真正的结构性防线是调用点里
+    「这条 entry 只命中一个对象」的断言 —— 两者叠加使用：
+
+      · 对象断言挡住"现在就已经命中多个对象"的条目；
+      · 具体性下限挡住"现在只命中一个、但宽到能放行**将来**出现的对象"的条目。
+
+    只做前者会漏：`exe_path_prefix = "C:\\"` 在当前快照里可能只命中一个对象
+    （因为该规则此刻只有一个对象命中），但它把整个 C 盘都放行了 ——
+    以后任何落在 C 盘的同类对象都会被静默忽略。红队 §2.1.3 指的就是这个残留。
+    """
+    v = (value or "").strip()
+    if mtype == "exe_path_prefix":
+        # 至少要到「盘符:\目录\子目录」这一级
+        segs = [x for x in v.replace("/", "\\").split("\\")
+                if x and not x.endswith(":")]
+        if len(segs) < 2:
+            return (f"路径前缀太宽（{v}）——至少给到「盘符:\\目录\\子目录」，"
+                    f"否则等于把这一整片目录都放行")
+    elif mtype in ("cmdline_contains", "subject_text_contains"):
+        if len(v) < 8:
+            return f"匹配文本太短（{v}）——至少 8 个字符，否则会命中大量无关对象"
+    return ""
+
+
+_ARTIFACT_SECTION_ZH = {
+    "tasks": "计划任务", "drivers": "内核驱动", "run_keys": "注册表启动项",
+    "defender": "Defender 排除项", "suspicious_reg": "可疑注册表键",
+}
+
+
 def build_report_html(st: dict) -> str:
     """由一份 state 快照生成 HTML 报告。
 
@@ -1189,6 +1360,17 @@ def build_report_html(st: dict) -> str:
     else:
         concl = ('本轮扫描未发现银狐相关风险特征。注意：本工具基于行为特征，'
                  '不能替代杀毒软件全盘扫描。')
+
+    # ---- 未取到的制品小节（F-008）
+    # "没查到"和"没取到"必须分开写。合并成一句"未发现异常"就是假阴性 ——
+    # 用户会以为那几类查过了、是干净的，实际上根本没采集到。
+    _unav = list(s.get("artifact_unavailable") or [])
+    _unav_html = ""
+    if _unav:
+        _names = "、".join(_ARTIFACT_SECTION_ZH.get(k, k) for k in _unav)
+        _unav_html = (f'<div class="warnbox">⚠ 本次有 <b>{len(_unav)}</b> 类系统痕迹'
+                      f'<b>未取到</b>：{_names}。<br>这几类<b>没有结论</b>，'
+                      f'不等于没有异常 —— 请重新扫描或检查权限。</div>')
 
     # ---- 二、异常进程
     rows = []
@@ -1300,6 +1482,7 @@ def build_report_html(st: dict) -> str:
    border-left:3px solid #3b82f6;padding-left:10px}}
  h3{{font-size:15px;margin:0 0 6px;display:flex;gap:10px;align-items:center}}
  .meta{{color:#7d8fa9;font-size:13px;margin-bottom:18px}}
+ .warnbox{{margin:12px 0;padding:10px 14px;border-radius:6px;font-size:13px;line-height:1.7;color:#ffd666;background:rgba(255,166,61,.10);border-left:3px solid #ffa53d}}
  .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:16px 0}}
  .kpi{{background:#121c2e;border:1px solid #1e2d45;border-radius:10px;padding:12px 14px}}
  .kpi b{{display:block;font-size:24px;color:#e8f0fb}} .kpi span{{color:#7d8fa9;font-size:12px}}
@@ -1341,6 +1524,7 @@ def build_report_html(st: dict) -> str:
 
 <h2>一、结论摘要</h2>
 <p>{concl}</p>
+{_unav_html}
 
 <p><b>本报告共列出 {b['rows']} 项异常</b>（其中需优先处置的严重+高危共
 <b>{b['need_action']}</b> 项），按类别分布如下：</p>

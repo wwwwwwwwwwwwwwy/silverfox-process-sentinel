@@ -26,8 +26,8 @@
 """
 from __future__ import annotations
 
-VERSION = "2026.10.05.3"
-BUILD = "2026-10-05 21:50"
+VERSION = "2026.10.06.0"
+BUILD = "2026-10-06 10:30"
 CHANNEL = "stable"
 
 
@@ -45,7 +45,13 @@ def compare(a: str, b: str) -> int:
     def parts(v):
         out = []
         for seg in str(v or "").strip().split("."):
-            out.append(int(seg) if seg.isdigit() else 0)
+            # ⚠️ 不能用 isdigit()：它对上标数字（²）等 Unicode 字符也返回 True，
+            #    但 int("²") 会抛 ValueError —— 而本函数在回归自检里明确声明
+            #    "异常输入不抛异常"。改成只认 ASCII 数字 + 兜底。
+            if seg.isascii() and seg.isdigit():
+                out.append(int(seg))
+            else:
+                out.append(0)
         return out
 
     pa, pb = parts(a), parts(b)

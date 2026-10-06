@@ -147,7 +147,8 @@ def main():
             sys.stdout.reconfigure(errors="replace")
         except Exception:
             pass
-        extra = [sys.executable] if getattr(sys, "frozen", False) else []
+        # ⚠️ 覆盖范围必须与运行期一致，否则健康安装上会误报「程序文件已被改动」
+        extra = integrity.default_extras()
         r = integrity.verify(server.APP_DIR, server.WORKSPACE, extra)
         print(f"完整性状态：{r['status_zh']}")
         print(f"  基线时间：{r['baseline_time']}   已校验 {r['checked']} 个文件")
