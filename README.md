@@ -12,7 +12,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)]()
 
 > **变更历史**：见 [CHANGELOG.md](CHANGELOG.md) —— 逐版本记录修复、新增、
-> **未做事项**与能力边界。当前版本 **v2026.10.08.2**。
+> **未做事项**与能力边界。当前版本 **v2026.10.08.3**。
 
 
 基于 CNCERT / 火绒 / FreeBuf / 先知社区等公开技术报告中的真实样本特征构建检测规则库，
@@ -900,10 +900,10 @@ icacls "<路径>" /grant  "NT AUTHORITY\Authenticated Users:(OI)(CI)(RX)" /T /C
 
 | | |
 |---|---|
-| **现象** | Edge / 微信 / WorkBuddy / 网易 UU / Intel DSA 全被判 `critical(82)`，界面"一片爆红"，连带 N005 把它们正常的 HTTPS 流量再报一遍 |
+| **现象** | Edge / 微信 / 一个 AI 编程辅助工具 / 网易 UU / Intel DSA 全被判 `critical(82)`，界面"一片爆红"，连带 N005 把它们正常的 HTTPS 流量再报一遍 |
 | **根因** | `deep_scan_process` 有一个「重试 4 次仍未验出就定罪」的分支。而实测 `verify_signatures` 约 **297 ms/文件**、首轮队列积压 **647 个**（≈3 分钟才能排空），调用方却只等约 **4 秒** → **计时器必然先到期** → 强行把未校验的 DLL 计入 sideload |
 | **实测** | 被定罪的 48 个 DLL **逐个复验全部「签名有效」**（Microsoft / Intel / Tencent / NetEase 签发） |
-| **修法** | ① 删掉定罪分支（**未校验永不定罪**）；② 登记 `_deep_pending`，由签名结果到达后**驱动复查**；③ X003 普通「同目录未签名 DLL」**high(82) → medium(45)**（命中 `SIDELOAD_DLL_HINTS` 仍 critical 92）；④ 排除监视器自身 PID（它跑在 WorkBuddy 自带 Python 上，原先把自己判成 P006） |
+| **修法** | ① 删掉定罪分支（**未校验永不定罪**）；② 登记 `_deep_pending`，由签名结果到达后**驱动复查**；③ X003 普通「同目录未签名 DLL」**high(82) → medium(45)**（命中 `SIDELOAD_DLL_HINTS` 仍 critical 92）；④ 排除监视器自身 PID（它跑在一个第三方 Python 运行时上，原先把自己判成 P006） |
 
 **教训（值得写进方法论）**：
 
@@ -970,6 +970,88 @@ F-021 白加黑 X003 13 条）；实机 `critical 4 → 0`，告警 `57 → 1`�
   重建基线 → `--verify-only` 退出码 0 → 重启）
 - 实机复现（把真实审计日志搬进隔离数据目录）：历史条目正确标 `resolved`、
   徽章只计当前真实问题、控制台无错误
+
+---
+
+### 3.19 第十一轮：命令行规则的两类误报 ——「取数」不等于「执行」，「清理子进程」不等于「杀软」（2026-10-08）
+
+#### 症状：critical 全是正规软件
+
+用户反馈"页面全是爆红"。上两轮修掉之后仍有 5 条 `critical(82)` 来自
+**P010 命令行内存加载 / 下载执行**，另有 3 条 `critical(92)` 来自
+**P014 命令行终止安全软件进程/服务** —— 命中的全是正常跑着的桌面程序。
+
+#### 一个关键的排查误区（值得单独记下来）
+
+**历史告警 ≠ 当前进程。**
+`alerts` 里的条目是从 `security.log` **回放**出来的，那些进程**早已退出**。
+拿当前进程快照去复算这些规则，结果必然是"0 命中" —— 看起来像规则没问题。
+正确做法是**从 `evidence` 里抠出原始命令行原文**，再喂回规则引擎跑。
+
+（`tools/verify_history.py` 就是干这个的：它把历史告警的命令行一条条取出、
+原样喂给规则做前后对照。本轮靠它把误报从 6/9 清到 9/9。）
+
+#### 根因 A：P010 把「取数」当成了「执行」
+
+原正则把两类**语义完全相反**的 cmdlet 归进了同一分支：
+
+| 写法 | 语义 |
+|---|---|
+| `invoke-expression` / `iex` / `downloadstring` / `frombase64string` | 取回内容后**直接执行** —— 这才是内存加载 |
+| `invoke-restmethod` / `invoke-webrequest`（含缩写 `irm` / `iwr`） | 取回内容**当数据用** —— PowerShell 里最标准的 HTTP 客户端 |
+
+实测那 5 条 critical 全部来自一个 AI 编程辅助工具用 `pwsh` 调 `api.github.com`
+**拉取仓库文件清单**（纯取数）。命令行里同时出现了下载 URL 与
+`[System.Text.UTF8Encoding]` 这类**编解码类型名**，于是一网打尽；
+`encoding` 里的 `enc` 还额外触发了 P010B。
+
+**修法**：
+- 取数型 cmdlet 一律**不进** P010；
+- `.NET` 解码类型名（`FromBase64String` / `UTF8Encoding` / `DeflateStream`）
+  要求**后跟 `(`** —— 只有真的是在**被调用**才算证据。
+
+#### 根因 B：P014 的 `/pid` 分支没有任何前提
+
+原正则的 `/pid\s+\d+` 分支**不要求指认目标**，于是：
+
+```
+taskkill /pid 1234 /f /t      ← 任何程序收尾时清理自己拉起的子进程
+```
+
+被判成 `critical(92)「命令行终止安全软件进程」`。实测 3 条命中分别来自
+一个 AI 编程辅助工具与另一个工具，**目标全是自己的子进程**。
+
+**修法**：按 PID 杀进程**本身没有任何恶意语义**，唯一有意义的场景是
+"**能指认出目标是安全软件**"。所以删掉 `/pid` 分支 ——
+银狐的真实手法是按**映像名**批量查杀（`/im 360tray.exe` 等），这类写法仍被覆盖。
+
+#### 修法汇总
+
+| 规则 | 改动 |
+|---|---|
+| `P010` | 排除取数型 cmdlet（`Invoke-RestMethod` / `Invoke-WebRequest` / `irm` / `iwr`）；解码类型名要求后跟 `(` |
+| `P014` | 删除 `/pid\s+\d+` 分支，只认能指认目标（安全软件映像名 / 服务名）的写法 |
+
+#### 双向验证（关键）
+
+新增 F-023 用例组共 **18 条**，是**双向**的：
+
+- **A 组（误报必须消失）**：`Invoke-RestMethod` 拉清单、`Invoke-WebRequest` 下载落盘、
+  `taskkill /pid` 清理子进程、按映像名杀非安全软件 → 全部**不命中**
+- **B 组（真检出必须仍在）**：`IEX` + `DownloadString` 内存执行、`Invoke-Expression`
+  执行变量载荷、`iex` 包裹 `iwr`（取回的字节被直接执行）、按映像名批量查杀 360 /
+  火绒 / Defender、`Stop-Process` 杀 Defender、停 / 删 Defender 服务 → 全部**仍然命中**
+
+> 只测 A 组是不够的 —— "把规则整条删掉"也能通过 A 组，那是把误报换成了漏报。
+
+用例通过 **AST 从 `rules.py` 提取真正则**，而不是手抄一份正则进测试 ——
+避免"改了源码但忘了同步测试"这类静默失效。
+
+#### 验证
+
+- 历史告警命令行复算：**6/9 → 9/9** 误报消除
+- 定向用例 **17/17**；回归自检 **340 → 358 项通过**（唯一失败项 `estats` 需管理员，属预期）
+- 实机：告警 `14 → 0`，`critical/high` `0/0`，界面 `undefined`/`NaN` `0/0`
 
 ---
 
@@ -1126,9 +1208,10 @@ silverfox-process-sentinel/
 │       └── app.js
 └── tools/                      # 验证脚本（不参与运行，可单独跑）
     ├── _common.py              # 公共模块：定位仓库、识别实例、HTTP 封装
-    ├── 回归自检.py              # 340 项断言，无需运行实例，秒级跑完
+    ├── 回归自检.py              # 358 项断言，无需运行实例，秒级跑完
     ├── e2e_whitelist.py        # 已知项机制的端到端验证
     ├── e2e_integrity.py        # 完整性自检的双向验证
+    ├── verify_history.py       # 历史告警命令行复算（误报回归取证，见 3.19）
     ├── serve_net_demo.py       # 用合成数据填充网络页，验证"有检出结果时"的渲染
     ├── shot_net.py             # 网络页的无头浏览器质检（需可选依赖 playwright）
     └── list_findings.py        # 排查助手：列出当前所有命中及证据
@@ -1164,10 +1247,11 @@ silverfox-process-sentinel/
 ```bat
 pip install psutil
 
-python tools\回归自检.py          :: 340 项断言（含网络心跳算法与误报边界），秒级完成
+python tools\回归自检.py          :: 358 项断言（含网络心跳算法与误报边界），秒级完成
 python tools\e2e_whitelist.py     :: 已知项机制（会自行启停监视器）
 python tools\e2e_integrity.py     :: 完整性自检
 python tools\list_findings.py     :: 列出当前所有命中及证据
+python tools\verify_history.py    :: 历史告警命令行复算（误报是否真被修掉）
 
 :: 网络页界面质检（需要可选的 playwright）
 pip install playwright && playwright install chromium
@@ -1192,6 +1276,7 @@ python tools\shot_net.py 8891              :: 无头浏览器逐屏截图 + 控�
 | 已知项机制端到端（含守卫哈希失效验证） | 14 | 全过 |
 | 完整性自检生命周期（含真篡改检出） | 11 | 全过 |
 | 接口安全（CSRF 五路径 + 令牌 + 路径穿越 + 受保护 PID） | 9 | 全过 |
+| **命令行规则误报边界**（F-023：P010 取数/执行、P014 清理子进程/杀软，双向 18 条） | **18** | 全过 |
 | 无镜像文件进程显示 | 5 | 全过 |
 
 **关键数字**：真机完整启动周期（含 600+ 文件签名校验）**告警时间线为空**；

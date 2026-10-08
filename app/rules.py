@@ -644,15 +644,45 @@ def rules_process(proc: dict, ctx: dict) -> list[dict]:
     #   · P013/P014 合并原 iocs.SUSPICIOUS_CMDLINE_PATTERNS / SECURITY_VENDOR_TOKENS
     #     中的 bcdedit 破坏恢复、sc 停安全服务、Stop-Process 杀安全软件、
     #     icacls 改 ACL、net user 建账户等原为死代码的模式。
+    #
+    # 2026-10-08 第二轮误报修复 —— 这两条规则此前把**正规软件的对外联网动作**
+    # 判成了"无文件攻击"，实测证据（同一台机器、同一批 critical 告警）：
+    #
+    #   P010 误报源：正则把 `invoke-webrequest` 与 `invoke-restmethod`（含缩写 `irm`）
+    #   和 `invoke-expression` 归成了同一分支，但两者的语义**完全相反**：
+    #     · `invoke-expression` / `iex` / `downloadstring` / `frombase64string`
+    #       = 取回内容后**直接执行**（这才是内存加载，无文件攻击的本体）；
+    #     · `invoke-restmethod` / `invoke-webrequest` = 取回内容**当数据用**，
+    #       是 PowerShell 里最标准的 HTTP 客户端，绝不执行取回的字节。
+    #   实测 5 条 critical(82) 全部是 `Invoke-RestMethod` —— 一个 AI 编程辅助工具
+    #   用 pwsh 从 api.github.com 拉取仓库文件清单，命令行里同时出现了下载 URL
+    #   与 `[System.Text.UTF8Encoding]` 这类**编解码类型名**，于是被"从网络或
+    #   Base64 取载荷直接在内存执行"这条描述一网打尽（`encoding` 里的 `enc`
+    #   还额外触发了 P010B）。
+    #   修复要点：① 取数型 cmdlet 不进 P010；② 光有 .NET 类型名不算证据 ——
+    #   `FromBase64String` / `UTF8Encoding` / `DeflateStream` 作为**类型名**在
+    #   大量正常脚本里出现，只有真正的**解码调用**（后面跟着 `(`）才作数。
+    #
+    #   P014 误报源：原正则的 `/pid\s+\d+` 分支**没有任何前提**，于是
+    #   `taskkill /pid 1234 /f /t` —— 任何程序收尾时清理自己拉起的子进程 ——
+    #   都被判成 critical(92)「命令行终止安全软件进程」。实测 3 条命中分别来自
+    #   <workspace>AI.exe 与另一个无父进程记录的工具调用，目标全是自己的子进程。
+    #   修复要点：按 PID 杀进程**本身没有任何恶意语义**，唯一有意义的场景是
+    #   "能指认出目标是安全软件"；指认不出来就不该定罪。
     cmd_rules = [
         (r"add-mppreference.*(-exclusionpath|-exclusionprocess|-exclusionextension"
          r"|-disablerealtimemonitoring|-disablerealtimemonitoring\s+\$true)",
          "P009", "命令行写入 Windows Defender 排除项/关闭实时防护", "critical", 88,
          "CNCERT 报告明确将该行为列为银狐标志性动作：把 C:\\Users、C:\\ProgramData、"
          "C:\\Windows\\System32 等大范围目录加入 Defender 排除项，或直接关闭实时防护。"),
-        (r"frombase64string|downloadstring|\biex\b|invoke-expression",
+        # ⚠️ 取数型 cmdlet（Invoke-RestMethod / Invoke-WebRequest 及其缩写 irm/iwr）
+        #    一律排除；.NET 解码类型名要求后跟 `(`，即真的是在被调用。
+        (r"invoke-expression|downloadstring|downloaddata|frombase64string\s*\("
+         r"|convert-frombase64string|\b(?:iex|icm)\s*[(\s'\"]",
          "P010", "命令行内存加载 / 下载执行", "high", 82,
-         "典型无文件攻击：从网络或 Base64 取载荷直接在内存执行。"),
+         "典型无文件攻击：从网络或 Base64 取载荷直接在内存执行。"
+         "（注意：Invoke-RestMethod / Invoke-WebRequest 只是 HTTP 取数，"
+         "不执行取回的字节，故明确不计入本条。）"),
         (r"-(?:encodedcommand|enc)\b(?::|\s+)[a-z0-9+/=]{32,}",
          "P010B", "命令行使用 Base64 编码执行", "medium", 55,
          "银狐会用 -EncodedCommand 隐藏真实命令，但**这一手法在正规运维中同样常见**"
@@ -678,13 +708,21 @@ def rules_process(proc: dict, ctx: dict) -> list[dict]:
          r"net\s+localgroup\s+administrators\s+\S+\s+/add",
          "P013", "命令行破坏系统恢复/日志/防火墙/ACL/建账户", "high", 78,
          "破坏取证与恢复能力、篡改 ACL、创建账户提权的典型远控/勒索前置动作。"),
+        # ⚠️ /pid 分支必须绑定"目标是安全软件"的前提，否则任何清理子进程的
+        #    taskkill /pid N /f /t 都会被判 critical —— 那是纯噪音。
         (r"taskkill.*(/im\s+(360|huorong|kxe|qqpcmgr|avp|msmpeng|windefend|defender)"
-         r"|/pid\s+\d+)|stop-process.*-name\s+(360|huorong|kxe|qqpcmgr|avp|msmpeng"
+         r"|(/f\b|/t\b).*(360|huorong|kxe|qqpcmgr|avp|msmpeng|windefend|defender)"
+         r"|(360|huorong|kxe|qqpcmgr|avp|msmpeng|windefend|defender).*(/f\b|/t\b))"
+         r"|stop-process.*(-name|-processname)\s+(360|huorong|kxe|qqpcmgr|avp|msmpeng"
          r"|windefend|defender)|sc\s+(stop|delete|config)\s+(windefend|wscsvc|sense"
          r"|mdcoresvc|mpssvc)",
          "P014", "命令行终止安全软件进程/服务", "critical", 92,
          "银狐内置 212 个安全软件映像名列表用于批量查杀，配合 BYOVD 驱动强杀。"
-         "（已覆盖 taskkill / Stop-Process / sc stop 三种写法。）"),
+         "（已覆盖 taskkill / Stop-Process / sc stop 三种写法。）"
+         "\n\n【本条为何不覆盖 `taskkill /pid <纯数字>`】按 PID 杀进程本身没有任何"
+         "恶意语义 —— 任何程序收尾清理自己拉起的子进程都会这么做（实测本机 3 条"
+         "此类命令全部来自正规桌面程序）。银狐的真实手法是按**映像名**批量查杀"
+         "安全软件（`/im 360tray.exe` 等），因此本条只认能指认目标的写法。"),
         (r"reg\s+add.*\\run\b", "P015", "命令行写入注册表启动项", "high", 72,
          "银狐使用 HKCU\\...\\CurrentVersion\\Run 建立用户级持久化。"),
     ]
