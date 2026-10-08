@@ -11,6 +11,9 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)]()
 
+> **变更历史**：见 [CHANGELOG.md](CHANGELOG.md) —— 逐版本记录修复、新增、
+> **未做事项**与能力边界。当前版本 **v2026.10.08.2**。
+
 
 基于 CNCERT / 火绒 / FreeBuf / 先知社区等公开技术报告中的真实样本特征构建检测规则库，
 共 **61 条规则**，覆盖进程伪装、PPID 欺骗、签名伪造、白加黑侧加载、计划任务持久化、
