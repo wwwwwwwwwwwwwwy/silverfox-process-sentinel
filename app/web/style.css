@@ -296,6 +296,45 @@ table.grid td{padding:7px 10px;vertical-align:middle;overflow:hidden}
 .seccard .acts{margin-top:9px}
 .seccard .acts .btn{padding:4px 10px;font-size:11.5px}
 
+/* ---------------------------------------------------- 受监控文件 / 目录（2026-10-07 新增） */
+.watchbox{margin-top:2px}
+.wcard{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+  padding:13px 15px;border-left:3px solid var(--accent)}
+.wsub{font-size:11.5px;color:var(--dim);line-height:1.7;margin-bottom:11px}
+.wadd{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.wadd input[type=text]{flex:1;min-width:240px;background:var(--panel-2);
+  border:1px solid var(--border-2);border-radius:7px;color:var(--text);
+  font-family:var(--mono);font-size:12px;padding:7px 10px;outline:none}
+.wadd input[type=text]:focus{border-color:var(--accent)}
+.wadd input[type=text]::placeholder{color:var(--dim)}
+.wchk{display:flex;align-items:center;gap:5px;font-size:11.5px;color:var(--text-2);
+  white-space:nowrap;cursor:pointer;user-select:none}
+.warnbox{margin-top:10px;padding:7px 10px;border-radius:7px;font-size:11.5px;
+  line-height:1.7;color:#ffcf9a;background:rgba(255,165,61,.1);
+  border:1px solid rgba(255,165,61,.3)}
+.wtable{width:100%;border-collapse:collapse;margin-top:12px;table-layout:fixed}
+.wtable th{text-align:left;font-size:11px;font-weight:600;color:var(--muted);
+  padding:6px 8px;border-bottom:1px solid var(--border);letter-spacing:.3px}
+.wtable td{padding:9px 8px;border-bottom:1px solid var(--border);font-size:11.5px;
+  color:var(--text-2);vertical-align:top;word-break:break-word}
+.wtable th.wnum,.wtable td.wnum{width:104px;white-space:nowrap}
+.wtable th.wact,.wtable td.wact{width:82px;text-align:right;white-space:nowrap}
+.wlabel{color:var(--text);font-weight:600;font-size:12px}
+.wpathline{font-family:var(--mono);font-size:11px;color:var(--dim);
+  word-break:break-all;margin-top:3px}
+.wstatus{font-size:11px;color:var(--high);margin-top:4px;line-height:1.6}
+.wbad{color:var(--high);font-weight:600}
+.wok{color:var(--dim)}
+.wnone{font-size:11.5px;color:var(--dim);padding:13px 0;line-height:1.75}
+.wacts{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
+.wacts .btn{padding:5px 11px;font-size:11.5px}
+.wlog{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);
+  font-size:11px;color:var(--dim);line-height:1.75;word-break:break-all}
+.wlog code{font-family:var(--mono);font-size:10.5px;color:var(--text-2)}
+.wnote{font-size:11px;color:var(--dim);line-height:1.75;margin-top:7px}
+.logtag{margin-left:6px;padding:1px 6px;border-radius:4px;font-size:10px;
+  color:var(--muted);background:var(--panel-3);border:1px solid var(--border-2)}
+
 /* ---------------------------------------------------- 详情抽屉 */
 .drawer-mask{position:fixed;inset:0;background:rgba(3,7,14,.6);backdrop-filter:blur(2px);
   opacity:0;pointer-events:none;transition:.22s;z-index:40}
@@ -566,3 +605,12 @@ table.netgrid tbody tr.reg-hi.high{box-shadow:inset 3px 0 0 0 var(--high)}
   margin:10px 0;padding:10px 14px;border-radius:6px;font-size:13px;line-height:1.7;
   color:#ffd666;background:rgba(255,166,61,.09);border-left:3px solid #ffa53d;
 }
+
+/* ---------- 网络页：白加黑溯源 ---------- */
+.prov{display:block;font-weight:400;color:var(--dim);font-size:10.5px;
+  font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
+.dsec.bjh{border-left:3px solid var(--high);background:rgba(255,92,92,.06)}
+.dsec.bjh h4{color:var(--high)}
+.dsec.bjh .badge.crit{background:var(--crit);color:#fff}
+.dsec.bjh .badge.high{background:var(--high);color:#1b1b1b}
+dd.cmd{white-space:pre-wrap;word-break:break-all;max-height:120px;overflow:auto}

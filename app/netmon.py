@@ -50,6 +50,7 @@ C2 要活着，就必须**周期性**地向控制端报到（心跳 / beacon）�
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import threading
 import time
@@ -66,7 +67,12 @@ import rules
 # ================================================================
 
 DEFAULT_SAMPLE_INTERVAL = 1.0        # 采样周期（秒）
-DURATION_STOPS = [30, 60, 120, 180, 300, 600, 900]
+# 观测时长档位（秒）。2026-10-07 起上限从 900（15 分钟）放宽到 1800（30 分钟）：
+# 用户反馈"想让它一直盯着"。长窗口对**心跳**这类周期性行为更有价值 ——
+# 观测越久，"间隔是否稳定"这个结论的置信度越高（confidence = min(1, n/6)）。
+# 代价：固定内存占用会随窗口线性增长（事件表上限见 MAX_EVENTS / MAX_FLOWS），
+# 以及用户要看得更久才有结论 —— 所以默认值仍是 120 秒，长窗口按需手动拖。
+DURATION_STOPS = [30, 60, 120, 180, 300, 600, 900, 1800]
 DEFAULT_DURATION = 120
 
 MAX_FLOWS = 1500                     # 流量表上限（防内存无限增长）
@@ -782,6 +788,44 @@ class NetMonitor:
         sig = (proc or {}).get("signature") or {}
         sig_zh = sig.get("status_zh") or ("未在进程表中找到该 PID" if not proc else "校验中")
 
+        # ---- 进程溯源信息（防止「白加黑」：不只看进程名，还看父进程 / 目录 / 账户 / 命令行）
+        # 这些字段来自每轮进程快照，稳定不闪烁，是识别「借名/借签名」的最直接线索：
+        #   - parent_name 不对 -> 比如 svchost.exe 的父进程不是 services.exe；
+        #   - proc_dir 落在用户可写目录 -> 比如 svchost.exe 却从 Users\Public 启动；
+        #   - proc_user / cmdline 异常 -> 以奇怪账户或可疑命令行拉起。
+        ppid = (proc or {}).get("ppid") or 0
+        pname = (proc or {}).get("parent_name") or ""
+        pdir = (proc or {}).get("dir") or ""
+        puser = (proc or {}).get("username") or ""
+        pctime = (proc or {}).get("create_time") or 0
+        pcmd = (proc or {}).get("cmdline_str") or ""
+
+        # 白加黑侧加载信号：取进程自身的 X 系列深度扫描结论（X001 IOC 模块 /
+        # X002 伪装扩展名模块 / X003 同目录未签名 DLL 侧加载）。
+        # 这些结论由 server 固化在 mod_scan 中、随 proc 一并推给 netmon，跨轮稳定。
+        x_fs = [f for f in ((proc or {}).get("findings") or [])
+                if (f.get("rule_id") or "").startswith("X")]
+        mod_ioc = any(f.get("rule_id") == "X001" for f in x_fs)
+        mod_disguised = any(f.get("rule_id") == "X002" for f in x_fs)
+        mod_sideload = any(f.get("rule_id") == "X003" for f in x_fs)
+        if mod_ioc:
+            mod_summary = "加载银狐 IOC 模块"
+        elif mod_disguised:
+            mod_summary = "加载伪装扩展名的可执行模块"
+        elif mod_sideload:
+            mod_summary = "疑似白加黑侧加载（同目录未签名 DLL）"
+        else:
+            mod_summary = ""
+        mod_level = "clean"
+        if x_fs:
+            sevs = [f.get("severity") for f in x_fs]
+            mod_level = ("critical" if "critical" in sevs
+                         else "high" if "high" in sevs
+                         else "medium" if "medium" in sevs else "low")
+        # 强信号才自动升级网络风险，避免把「绿色软件自带未签名 DLL」误判为高危：
+        # 强信号 = 命中 IOC 模块 / 伪装模块 / 命中侧加载提示名单（X003 判 critical）。
+        mod_strong = mod_ioc or mod_disguised or (mod_sideload and mod_level == "critical")
+
         # ---- 生成规则命中
         findings: list[dict] = []
         ev_base = (f"PID {fl.pid}（{name}）→ {fl.rip}:{fl.rport}　"
@@ -852,6 +896,21 @@ class NetMonitor:
                 "该进程已被进程行为规则判为高风险，同时保持着公网连接。"
                 "请优先核查这条连接的去向与该进程的来源。"))
 
+        # N006 白加黑侧加载进程持有公网连接：把「进程模块侧加载结论」与「网络外联」关联。
+        # 仅对**公网**连接生效（内网 / 回环连接不产生，绿色软件自带的未签名同目录 DLL
+        # 走本地 / 内网通信是常态，不应在网络页误报）。弱信号（普通未签名同目录 DLL）
+        # 只作徽标提示，不自动升级，避免对开源 / 绿色软件误报。
+        if mod_strong and scope == "public":
+            findings.append(rules.finding(
+                "N006", f"白加黑侧加载进程持有公网连接（{mod_summary}）", "high", 80, "network",
+                f"{ev_base}\n进程溯源：父进程 {pname}（PID {ppid}）· 路径 {pdir} · 账户 {puser}\n"
+                f"模块侧加载结论：{mod_summary}\n"
+                "该进程借用合法进程形态，却从自身目录加载了可疑模块并向公网通信，"
+                "符合银狐「白加黑」手法。仅凭进程名 / 签名不足以识破，"
+                "需结合父进程、路径、加载模块综合判断。",
+                "白加黑：银狐用带有效签名的合法程序（白文件）从自身目录加载恶意 DLL"
+                "（黑文件）。请在进程详情的「加载模块」中核对所加载 DLL 的来源与签名。"))
+
         score, level = rules.score_findings(findings)
 
         # 规律性高但没有任何旁证时，说明清楚"为什么它不算风险"，
@@ -911,6 +970,18 @@ class NetMonitor:
             "proc_untrusted": untrusted,
             "proc_trusted": trusted,
             "signature_zh": sig_zh,
+            "ppid": ppid,
+            "parent_name": pname,
+            "proc_dir": pdir,
+            "proc_user": puser,
+            "proc_ctime": pctime,
+            "proc_cmdline": pcmd,
+            "mod_ioc": mod_ioc,
+            "mod_disguised": mod_disguised,
+            "mod_sideload": mod_sideload,
+            "mod_level": mod_level,
+            "mod_summary": mod_summary,
+            "proc_mod_findings": x_fs,
             "endpoint_score": ep_score,
             "endpoint_why": ep_why,
             "udp_ports": sorted(set(udp_by_pid.get(fl.pid, [])))[:12],
@@ -1032,6 +1103,14 @@ class NetMonitor:
             "proc_score": f["proc_score"], "proc_level": f["proc_level"],
             "proc_untrusted": f["proc_untrusted"],
             "signature_zh": f["signature_zh"],
+            "parent_name": f.get("parent_name", ""),
+            "proc_dir": f.get("proc_dir", ""),
+            "proc_user": f.get("proc_user", ""),
+            "mod_sideload": f.get("mod_sideload", False),
+            "mod_ioc": f.get("mod_ioc", False),
+            "mod_disguised": f.get("mod_disguised", False),
+            "mod_level": f.get("mod_level", "clean"),
+            "mod_summary": f.get("mod_summary", ""),
             "endpoint_score": f["endpoint_score"],
             "score": f["score"], "level": f["level"], "verdict": f["verdict"],
             "resolution_limited": f["resolution_limited"],

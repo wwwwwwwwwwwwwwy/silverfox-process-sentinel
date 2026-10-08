@@ -26,8 +26,8 @@
 """
 from __future__ import annotations
 
-VERSION = "2026.10.06.0"
-BUILD = "2026-10-06 10:30"
+VERSION = "2026.10.08.1"
+BUILD = "2026-10-08 11:30"
 CHANNEL = "stable"
 
 

@@ -22,11 +22,13 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import auditlog
 import collector
 import integrity
 import iocs
 import netmon
 import paths
+import watch
 import whitelist
 import rules
 import version
@@ -105,7 +107,16 @@ INSTANCE_SECRET = _load_instance_secret(WORKSPACE)
 
 
 class Monitor:
-    def __init__(self, proc_interval: float = 3.0, artifact_interval: float = 180.0,
+    # 进程扫描间隔默认值。
+    # 2026-10-07 由 3.0 降到 1.0 —— 用户反馈"扫描速度太慢"。
+    # 依据：实测单轮进程扫描 180–215 ms，3 秒一轮时**每轮有约 2.8 秒是空的**；
+    # 改成 1 秒后每秒都有一次新快照，单核占用约 18%（原来约 9%），
+    # 短命进程的漏报窗口也从 3 秒缩到 1 秒。
+    # 想更激进可以用 --proc-interval 0.2（循环下限，约等于背靠背连续扫描）。
+    PROC_INTERVAL_DEFAULT = 1.0
+
+    def __init__(self, proc_interval: float = PROC_INTERVAL_DEFAULT,
+                 artifact_interval: float = 180.0,
                  net_interval: float = netmon.DEFAULT_SAMPLE_INTERVAL,
                  net_duration: float = netmon.DEFAULT_DURATION,
                  net_enabled: bool = True):
@@ -125,7 +136,20 @@ class Monitor:
         self._sig_failed: dict[str, int] = {}
         self.pending_sig: set[str] = set()
         self.deep_done: set[tuple] = set()
-        self._deep_retry: dict[tuple, int] = {}   # 深度扫描"等签名结果"的重试计数
+        # 白加黑模块扫描结论的持久化存储：key=(pid, create_time) -> 结论字典。
+        # 进程扫描每轮会重建全新的 proc 字典（见 scan_processes），深扫追加在旧对象上的
+        # X 系列 findings 会在下一轮被冲掉；这里把结论单独固化，供 _score_all 与 netmon
+        # 跨轮复用，使网络页的「白加黑侧加载」信号稳定不闪烁。
+        self.mod_scan: dict[tuple, dict] = {}
+        self._deep_retry: dict[tuple, int] = {}   # 深度扫描"等签名结果"的复查次数
+        # 深度扫描时"因模块尚未完成签名校验而挂起"的进程：key -> {待验模块路径}。
+        # ⚠️ 这是"先验签后定罪"能真正成立的**唯一**依据（2026-10-08 修复）。
+        #    在此之前，代码靠 `_deep_retry` 计时（重试 4 次 ≈ 4 秒）来猜"验完了没有"，
+        #    而首次运行签名队列积压 647 个文件、按实测 297 ms/文件需要约 3 分钟 ——
+        #    计时器必然先到期，于是把 48 个**已正确签名**的同目录 DLL
+        #    （Edge / 微信 / <workspace> / 网易 UU / Intel DSA）全部定罪成白加黑，
+        #    界面上"一片爆红"。改为由 _sig_worker 在签名结果到达时释放复查。
+        self._deep_pending: dict[tuple, set[str]] = {}
         self.alerts: list[dict] = []
         self.known: dict[int, float] = {}       # pid -> create_time（用于识别新进程）
         self.first_seen_at = time.time()
@@ -162,8 +186,27 @@ class Monitor:
         except Exception:
             pass
 
+        # ---- 受监控文件 / 目录（2026-10-07 新增，见 watch.py）----
+        # 与 integrity 的分工：integrity 管"我这个工具被动了"，
+        # watch 管"用户指定的文件/目录被动了"。
+        self.watch_interval = 60.0          # 监控目标每 60 秒比一次
+        self.last_watch = 0.0
+        self.watch_result: dict = {"findings": [], "targets": [], "stats": {}}
+        # 去重键：同一条差异（同一个文件、同一种变化、同一个新哈希）
+        # 只告警一次 —— 否则每 60 秒就往时间线塞一条，把真告警挤出去。
+        self._watch_seen: set[str] = set()
+        self.watch_busy = False
+        self._last_beep = 0.0
+
     # ------------------------------------------------------------ 主循环
     def start(self):
+        # 先把历史上发生过的「程序被改动 / 受监控文件被改动」读回时间线。
+        # 为什么：告警原本只活在内存里，重启就没了 —— 而用户看到可疑情况时的
+        # 第一反应常常就是"重启一下看看"，那一下正好把唯一的证据擦掉。
+        # 有了日志文件，重启后取证链是连续的（README 反面清单第 5 条）。
+        self._restore_alerts_from_log()
+        auditlog.write("startup", "info", "监视器启动",
+                       f"版本 {version.VERSION}  数据目录 {paths.DATA_DIR}")
         threading.Thread(target=self._loop, daemon=True, name="scan-loop").start()
         threading.Thread(target=self._sig_worker, daemon=True, name="sig-worker").start()
         # 「打开时自动扫描」：启动即开始一轮网络观测，无需用户点任何按钮。
@@ -171,11 +214,53 @@ class Monitor:
             self.netmon.start()
             self.netmon.start_session(self.net_duration, auto=True)
 
+    def _restore_alerts_from_log(self):
+        """把安全类历史事件还原成时间线条目（只还原"重要且低频"的那几类）。
+
+        ⚠️ 只还原安全事件，**不还原进程告警** —— 进程告警数量大且时效性强，
+        把昨天的几百条搬回今天的界面，只会让人对时间线脱敏。
+        """
+        KINDS = {"integrity", "watch", "whitelist"}
+        try:
+            recs = auditlog.tail(400)
+        except Exception:
+            return
+        restored = []
+        for r in recs:
+            if r.get("kind") not in KINDS:
+                continue
+            restored.append({
+                "time": (r.get("time") or "")[-8:],
+                "ts": r.get("ts") or 0,
+                "level": r.get("level") or "medium",
+                "score": 100 if r.get("level") == "critical" else 60,
+                "name": r.get("title") or "历史安全事件",
+                "pid": 0,
+                "exe": r.get("detail") or "",
+                "from_log": True,          # 界面据此标注「来自日志（重启前）」
+                "rules": [{"id": "LOG", "title": r.get("title") or "",
+                           "severity": r.get("level") or "medium",
+                           "evidence": r.get("detail") or ""}],
+                "text": "（重启前的记录，来自本地安全日志）" + (r.get("detail") or ""),
+            })
+        restored.sort(key=lambda x: x.get("ts") or 0, reverse=True)
+        with self.lock:
+            self.alerts.extend(restored[:80])
+            self.alerts.sort(key=lambda x: x.get("ts") or 0, reverse=True)
+            self.alerts_from_log = len(restored[:80])
+
     def _loop(self):
-        # 首轮：制品 + 进程 + 完整性
+        # 首轮顺序（2026-10-07 调整）：完整性 → **进程** → 系统痕迹（后台）
+        #
+        # 原来顺序是 完整性 → 系统痕迹 → 进程。而界面窗口要等到
+        # summary.scan_count >= 1 才弹出（见 main._open_when_ready），
+        # 于是用户必须先等"系统痕迹扫完"（本机实测约 5.6 秒，含一次
+        # PowerShell 启动）才能看到窗口 —— 这就是"打开程序要等好久"的来源。
+        # 改成先扫进程：冷启动单轮约 2.5 秒（首次枚举进程句柄的一次性开销），
+        # 窗口 3 秒内就有数据；系统痕迹与签名校验都改后台补齐，不阻塞首屏。
         self._safe(self.check_integrity)
-        self._safe(self.scan_artifacts)
         self._safe(self.scan_processes)
+        self._spawn_once("artifact", self.scan_artifacts)
         while self.running:
             t0 = time.time()
             self._safe(self.scan_processes)
@@ -183,8 +268,89 @@ class Monitor:
                 self._spawn_once("artifact", self.scan_artifacts)
             if time.time() - self.last_integrity > self.integrity_interval:
                 self._spawn_once("integrity", self.check_integrity)
+            if time.time() - self.last_watch > self.watch_interval:
+                self._spawn_once("watch", self.check_watch)
             time.sleep(max(0.2, self.proc_interval - (time.time() - t0)))
 
+    # ------------------------------------------------------------ 受监控文件
+    def check_watch(self, force_full: bool = False):
+        """比对受监控的文件 / 目录，把差异写进告警时间线。
+
+        ⚠️ 与自检同一个道理：**"变了"不等于"被攻击"**。
+        用户自己改了自己的文档也会命中。所以：
+          · 告警文案必须写清"这是你指定的监控目标发生了变化"，
+            而不是含糊地说"检测到威胁"；
+          · 提供「确认是我改的」按钮重建基线（/api/watch/accept）；
+          · 同一处改动只报一次，避免刷屏（刷屏本身就是一种掩盖）。
+        """
+        self.watch_busy = True
+        try:
+            res = watch.verify(force_full=force_full)
+            with self.lock:
+                self.watch_result = res
+                self.last_watch = time.time()
+                fresh = []
+                for f in res.get("findings") or []:
+                    sig = watch.signature(f)
+                    if sig in self._watch_seen:
+                        continue
+                    self._watch_seen.add(sig)
+                    fresh.append(f)
+                del self.alerts[400:]      # 先腾空间，再插新告警（防被自己截掉）
+                for f in fresh[:20]:
+                    self._push_watch_alert(f)
+                # 去重集合不能无限增长
+                if len(self._watch_seen) > 4000:
+                    self._watch_seen = set(list(self._watch_seen)[-2000:])
+        finally:
+            self.watch_busy = False
+
+    def _push_watch_alert(self, f: dict):
+        kind_zh = {"changed": "被修改", "added": "新增", "removed": "被删除"}.get(
+            f.get("kind"), f.get("kind"))
+        title = f"受监控文件{kind_zh}"
+        detail = f"{f.get('full_path')}"
+        # 一律给「中危」，**刻意不给 critical**：
+        # 用户自己编辑文档、软件自动更新都会命中这条规则，
+        # 一次正常的文档保存就顶格告警的话，用户三天内就会对告警脱敏 ——
+        # 那正是本工具最想避免的事（README 第 4 节的四条通用原则之一：
+        # 弱信号必须叠加上下文，强规则才可以独立成立）。
+        level = "medium"
+        self.alerts.insert(0, {
+            "time": time.strftime("%H:%M:%S"),
+            "ts": time.time(),
+            "level": level,
+            "score": 45.0,
+            "name": f"{title}：{f.get('label') or ''}",
+            "pid": 0,
+            "exe": f.get("full_path") or "",
+            "watch": True,
+            "rules": [{
+                "id": "W001", "title": title, "severity": level,
+                "evidence": (f"监控目标：{f.get('path')}\n"
+                             f"相对路径：{f.get('file')}\n"
+                             f"变化：{kind_zh}\n"
+                             f"哈希前 16 位：{f.get('old') or '(无)'} → {f.get('new') or '(无)'}"),
+                "advice": "如果这次变化是你自己造成的（编辑、更新、整理文件），"
+                          "在「规则与 IOC → 安全状态」里点一次「确认，重建监控基线」即可消除。"
+                          "如果不是你做的，先别急着重启或清理，先导出报告留证。",
+            }],
+            "text": f"[文件监控] {f.get('label') or ''} {kind_zh}：{f.get('file')}",
+        })
+        auditlog.write("watch", level, title, detail,
+                       extra={"target": f.get("path"), "file": f.get("file"),
+                              "change": f.get("kind")})
+        self._notify()
+
+    def accept_watch(self) -> dict:
+        """用户确认"这些变化是我做的" → 重建监控基线，并把去重表清空。"""
+        watch.rebuild()
+        with self.lock:
+            self._watch_seen.clear()
+        self.check_watch(force_full=True)
+        auditlog.write("watch", "info", "受监控基线已重建（用户确认）",
+                       f"当前监控目标数：{len(watch.listing().get('targets') or [])}")
+        return {"ok": True, "msg": "已重建监控基线"}
     def _refresh_integrity_baseline(self) -> list[str] | None:
         """界面合法增删已知项后刷新基线 —— **只接受 whitelist.json 的差异**。
 
@@ -300,6 +466,16 @@ class Monitor:
                         "text": "本程序文件与首次运行时的基线不一致，检测规则可能已被篡改",
                     })
                     del self.alerts[200:]
+                    # 留痕 + 发声：这两件事原本都没有。
+                    # 不留痕 → 重启就查不到"什么时候被改的"；
+                    # 不发声 → 用户没盯着界面时就错过了（顶栏变红只在看着时才有效）。
+                    auditlog.write(
+                        "integrity", "critical", "程序文件完整性异常",
+                        f"状态：{res.get('status_zh')}｜被修改：{'、'.join(res.get('changed') or []) or '无'}"
+                        f"｜新增：{'、'.join(res.get('added') or []) or '无'}"
+                        f"｜缺失：{'、'.join(res.get('removed') or []) or '无'}",
+                        extra={"status": res.get("status")})
+                    self._notify()
 
     def accept_integrity(self):
         """用户确认改动是自己做的 → 重建基线。"""
@@ -311,6 +487,8 @@ class Monitor:
                                         note="用户从界面确认并重建")
         integrity.save_sentinel(WORKSPACE, m, APP_DIR)
         self._integrity_alerted = False
+        auditlog.write("integrity", "info", "完整性基线已重建（用户确认）",
+                       f"共 {len(m)} 个文件")
         self.check_integrity()
         return True
 
@@ -338,6 +516,29 @@ class Monitor:
         except Exception:
             traceback.print_exc()
             return None
+
+    def _notify(self):
+        """安全告警发声提示。
+
+        为什么要它：顶栏变红**只在用户正看着界面时才有效**，
+        而这类工具恰恰是"挂在后台等出事"的。声音是唯一能穿透"没在看"的通道。
+
+        三条约束（都是踩过的常识）：
+          · 用 stdlib 的 winsound.MessageBeep，不引入任何依赖、不做网络通知；
+          · 5 秒节流 —— 一次批量改动可能产生几十条告警，
+            不做节流就会变成机关枪，用户第一反应是把工具关掉；
+          · 全程 try 包住 —— 没有声卡 / 远程会话静音时也必须照常告警，
+            发不出声不能影响检测本身。
+        """
+        now = time.time()
+        if now - getattr(self, "_last_beep", 0.0) < 5.0:
+            return
+        self._last_beep = now
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONHAND)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 采集
     def scan_processes(self):
@@ -408,20 +609,42 @@ class Monitor:
                 suppressed += len(dropped)
                 if not fs:
                     continue                      # 全部被忽略 → 不再显示该项
-                item = {**item, "findings": fs, "whitelisted": len(dropped)}
-                item["score"], item["level"] = rules.score_findings(fs)
+            # 无论有没有被过滤，都用最终 findings 重算一次 score/level。
+            # 原先只在 dropped 非空时才重算，于是"没被过滤"的项依赖 rules_* 事先
+            # 算好的值 —— 一旦某个 rules_* 分支忘了算，界面就又是 undefined。
+            # 统一在出口处重算，让"每个制品项都带 score/level"成为出口不变式。
+            item = {**item, "findings": fs, "whitelisted": len(dropped)}
+            item["score"], item["level"] = rules.score_findings(fs)
             kept.append(item)
-        kept.sort(key=lambda x: -x["score"])
+        kept.sort(key=lambda x: -(x.get("score") or 0.0))
         self.artifact_findings = kept
         self.artifact_whitelisted = suppressed
 
+    @staticmethod
+    def _has_external_conn(p: dict) -> bool:
+        # 判断进程是否握有「对外（非回环）的 ESTABLISHED 连接」。
+        # 用于拓宽深度扫描的覆盖范围：银狐「白加黑」的核心是外观正常的进程
+        # （签名有效、名字合法）从自身目录加载恶意 DLL —— 这类进程在进程行为评分里
+        # 往往是 clean，不会被原「只扫 critical/high」的逻辑覆盖。把它们也纳入模块扫描，
+        # 才能在网络页暴露其白加黑本质。仅当进程确实在对外通信时才值得付出扫描开销。
+        for c in (p.get("connections") or []):
+            rip = c.get("rip") or ""
+            if rip and c.get("status") == "ESTABLISHED" and not rules.is_loopback_ip(rip):
+                return True
+        return False
+
     def _deep_scan_cycle(self, limit: int = 4):
-        """对高危进程追加深度扫描（加载模块检查）。"""
+        # 对高危进程、以及持有对外连接的进程追加深度扫描（加载模块检查）。
         with self.lock:
             targets = [p for p in self.procs
-                       if p.get("level") in ("critical", "high")
+                       if (p.get("level") in ("critical", "high")
+                           or self._has_external_conn(p))
                        and (p["pid"], p.get("create_time")) not in self.deep_done][:limit]
             ctx = self._ctx()
+            # 回收已退出进程的待复查登记，避免 _deep_pending 无界增长
+            live = {(p["pid"], p.get("create_time")) for p in self.procs}
+            for k in [k for k in self._deep_pending if k not in live]:
+                self._deep_pending.pop(k, None)
         if not targets:
             return
         changed = False
@@ -430,29 +653,75 @@ class Monitor:
             try:
                 extra, pending = rules.deep_scan_process(p, ctx)
             except Exception:
+                traceback.print_exc()
                 extra, pending = [], []
             with self.lock:
+                # 无论有没有待验模块，本轮都算"扫过了"。
+                # ⚠️ 不能因为"还有模块在等校验"就 continue —— 每轮只有 4 个名额，
+                #    一个模块验不出来的进程会长期霸占名额，把其它进程活活饿死。
+                #    复查由 _sig_worker 在签名结果到达时驱动（见那里的 _deep_pending 释放）。
+                self.deep_done.add(key)
+                # 签名校验连续失败 3 次以上的模块不再排队（F-006），也不再等待它。
+                pending = [mp for mp in pending
+                           if self._sig_failed.get(mp.lower(), 0) < 3]
                 if pending:
-                    # 有模块尚未做签名校验：排队校验，本轮不定罪，等签名批次完成后再复查。
                     self.pending_sig.update(mp for mp in pending
                                             if mp.lower() not in self.sig_cache)
-                    retries = self._deep_retry.get(key, 0) + 1
-                    self._deep_retry[key] = retries
-                    if retries < 4:
-                        continue
-                    # 重试耗尽（签名一直校验不出来）：按可疑处理，避免无限等待形成盲区
-                    try:
-                        extra, _ = rules.deep_scan_process(p, ctx, treat_unknown_as_bad=True)
-                    except Exception:
-                        pass
-                self.deep_done.add(key)
-                if extra:
+                    self._deep_pending[key] = set(pending)
+                # 复查轮（_deep_retry > 0）即使结论为空也必须写回 mod_scan：
+                # 上一轮"等待校验"时留下的结论必须被清掉，否则误报会永久粘住。
+                if extra or self._deep_retry.get(key, 0) > 0:
                     p.setdefault("findings", []).extend(extra)
                     p["score"], p["level"] = rules.score_findings(p["findings"])
+                    self._store_mod_scan(key, extra)
                     changed = True
         if changed:
             with self.lock:
-                self.procs.sort(key=lambda x: -x["score"])
+                self.procs.sort(key=lambda x: -(x.get("score") or 0.0))
+
+    def _store_mod_scan(self, key: tuple, extra: list[dict]):
+        # 把深度扫描的 X 系列模块结论固化进 self.mod_scan，跨进程扫描轮次保留。
+        # 进程扫描每轮重建全新 proc 字典（见 scan_processes），旧对象上的 X findings 会丢失；
+        # 这里单独存一份，使：① _score_all 能把 X 结论重新并回进程评分；
+        # ② netmon 的 _analyze_flow 能稳定读到白加黑信号，网络页不闪烁。
+        ioc = any(f.get("rule_id") == "X001" for f in extra)
+        disguised = any(f.get("rule_id") == "X002" for f in extra)
+        sideload = any(f.get("rule_id") == "X003" for f in extra)
+        sevs = [f.get("severity") for f in extra]
+        level = ("critical" if "critical" in sevs
+                 else "high" if "high" in sevs
+                 else "medium" if "medium" in sevs else "low")
+        if ioc:
+            summary = "加载银狐 IOC 模块"
+        elif disguised:
+            summary = "加载伪装扩展名的可执行模块"
+        elif sideload:
+            summary = "疑似白加黑侧加载（同目录未签名 DLL）"
+        else:
+            summary = ""
+        # ⚠️ 必须**整条拷贝**，不能只挑几个字段。
+        #    2026-10-08 实测缺陷：这里原先白名单式地只保留
+        #    rule_id / title / severity / severity_zh / evidence / advice 六个键，
+        #    **漏掉了 weight**（以及 category / category_zh）。
+        #    这些残缺 finding 会在 _score_all 里被并回进程的 findings 列表，
+        #    再交给 rules.score_findings() —— 后者读 f["weight"] 直接抛 KeyError，
+        #    而异常从 _score_all 的 for 循环中逃逸，**其后所有进程不再被评分**。
+        #    实测后果：276 个进程中 156 个没有 score/level，界面「风险」列显示
+        #    undefined、标签页计数恒为 0，服务端每轮扫描（1 秒）打印一次 traceback。
+        #    凡是"存一份供后续复用"的结构，字段集必须与生产它的 finding() 一致；
+        #    这里直接用 dict(f) 整条复制，从根上避免再次漏字段。
+        self.mod_scan[key] = {
+            "ioc": ioc, "disguised": disguised, "sideload": sideload,
+            "level": level, "summary": summary,
+            "findings": [dict(f) for f in extra],
+        }
+        # 控制体积：只保留最近 512 条，越早的越不重要。
+        if len(self.mod_scan) > 512:
+            excess = len(self.mod_scan) - 512
+            old_keys = sorted(self.mod_scan.keys(),
+                              key=lambda k: (k[1] if len(k) > 1 else 0))[:excess]
+            for k in old_keys:
+                self.mod_scan.pop(k, None)
 
     # ------------------------------------------------------------ 评分
     def _ctx(self) -> dict:
@@ -471,20 +740,41 @@ class Monitor:
         ctx = self._ctx()
         wl = whitelist.load()
         for p in self.procs:
+            # ⚠️ 逐进程隔离（2026-10-08 加固）。
+            #    原先只有 rules_process 被 try 包住，后面几步（并回 mod_scan 结论、
+            #    已知项过滤、score_findings）裸奔 —— 其中任何一步抛异常，都会
+            #    跳出整个 for 循环，**导致该进程之后的所有进程永远拿不到 score/level**，
+            #    界面直接显示 undefined。实测就是这么发生的（详见 _store_mod_scan 注释）。
+            #    现在把每个进程的处理整体隔离，并在任何失败下写入兜底值：
+            #    评分是显示层的基础设施，宁可某个进程显示为"正常"，
+            #    也不能让整张表失去可读性。
             try:
-                fs = rules.rules_process(p, ctx)
+                try:
+                    fs = rules.rules_process(p, ctx)
+                except Exception:
+                    traceback.print_exc()
+                    fs = []
+                # 保留深度扫描的 X 系列模块结论（白加黑侧加载 / IOC 模块 / 伪装模块）。
+                # 这些结论由 _deep_scan_cycle 固化在 self.mod_scan，跨进程扫描轮次保留 ——
+                # 否则每轮重建 proc 字典会把它们冲掉，网络页的「白加黑」信号会闪烁。
+                mod = self.mod_scan.get((p["pid"], p.get("create_time")))
+                if mod:
+                    for f in mod["findings"]:
+                        if f not in fs:
+                            fs.append(f)
+                # 已知项过滤：只忽略"规则号 + 匹配条件 + 守卫哈希"三者都命中的告警
+                fs, dropped = whitelist.filter_findings(fs, p, wl)
+                p["findings"] = fs
+                p["whitelisted"] = len(dropped)
+                p["score"], p["level"] = rules.score_findings(fs)
             except Exception:
-                fs = []
-            # 保留深度扫描已追加的规则
-            for old in p.get("findings", []) or []:
-                if old.get("rule_id", "").startswith("X") and old not in fs:
-                    fs.append(old)
-            # 已知项过滤：只忽略"规则号 + 匹配条件 + 守卫哈希"三者都命中的告警
-            fs, dropped = whitelist.filter_findings(fs, p, wl)
-            p["findings"] = fs
-            p["whitelisted"] = len(dropped)
-            p["score"], p["level"] = rules.score_findings(fs)
-        self.procs.sort(key=lambda x: (-x["score"], x["name"].lower()))
+                traceback.print_exc()
+                p.setdefault("findings", [])
+                p.setdefault("whitelisted", 0)
+                p["score"], p["level"] = 0.0, "clean"
+        # 排序键同样必须容错：任何进程缺 score/name 都不能让排序整体失败。
+        self.procs.sort(key=lambda x: (-(x.get("score") or 0.0),
+                                       (x.get("name") or "").lower()))
 
     def _detect_new_processes(self):
         now_ids = {}
@@ -497,7 +787,9 @@ class Monitor:
         self.known = now_ids
 
     def _push_alert(self, p: dict):
-        top = sorted(p.get("findings", []), key=lambda f: -f["weight"])[:3]
+        # 排序键用 .get 兜底：告警推送发生在扫描线程里，一条畸形 finding
+        # 不该让告警时间线整体停摆（同 _score_all 的加固理由）。
+        top = sorted(p.get("findings", []), key=lambda f: -(f.get("weight") or 0))[:3]
         self.alerts.insert(0, {
             "time": time.strftime("%H:%M:%S"),
             "ts": time.time(),
@@ -517,7 +809,7 @@ class Monitor:
                        # 这类关键提示就写在 advice 里，而用户最先看到的就是告警时间线。
                        # 初版只带 evidence，导致提示只在进程详情里出现、在最需要的地方缺席。
                        "advice": f.get("advice", "")} for f in top],
-            "text": f"新增{p['level']}级进程：{p['name']} (PID {p['pid']}) · " +
+            "text": f"新增{p.get('level') or 'clean'}级进程：{display_proc_name(p)} (PID {p['pid']}) · " +
                     "；".join(f["title"] for f in top),
         })
         del self.alerts[200:]
@@ -551,7 +843,7 @@ class Monitor:
 
         由 netmon 线程回调，**调用时不得持有 netmon.lock**（见锁序约定）。
         """
-        top = sorted(f.get("findings") or [], key=lambda x: -x["weight"])[:3]
+        top = sorted(f.get("findings") or [], key=lambda x: -(x.get("weight") or 0))[:3]
         self.alerts.insert(0, {
             "time": time.strftime("%H:%M:%S"),
             "ts": time.time(),
@@ -599,6 +891,28 @@ class Monitor:
                     for p in batch:
                         if p.lower() in self.sig_cache:
                             self._sig_failed.pop(p.lower(), None)
+
+                    # ★ 关键：把"因模块尚未校验而挂起的深度扫描"放行复查。
+                    #   这是"先验签后定罪"能真正成立的唯一依据（2026-10-08 修复）。
+                    #   没有这一步，就只能靠计时器猜"验完了没有"—— 实测猜错的代价是
+                    #   Edge / 微信 / <workspace> / 网易 UU / Intel DSA 这 5 个正规软件
+                    #   被判 critical（它们那 48 个同目录 DLL 逐个复验**全部签名有效**，
+                    #   只是还排在 647 个文件的校验队列里没轮到）。
+                    #   放行方式：把进程从 deep_done 里移除，下一轮 _deep_scan_cycle
+                    #   就会带着"已填好的 sig_cache"重新扫描它，从而得出正确结论。
+                    for _k, _mods in list(self._deep_pending.items()):
+                        _left = {m for m in _mods
+                                 if m.lower() not in self.sig_cache
+                                 and self._sig_failed.get(m.lower(), 0) < 3}
+                        if _left:
+                            self._deep_pending[_k] = _left      # 还有模块没验完，继续等
+                        else:
+                            self._deep_pending.pop(_k, None)
+                            _n = self._deep_retry.get(_k, 0) + 1
+                            self._deep_retry[_k] = _n
+                            if _n <= 3:                          # 复查次数上限，防死循环
+                                self.deep_done.discard(_k)
+
                     self._score_all()
                     if self.artifacts:
                         self._score_artifacts()
@@ -657,6 +971,12 @@ class Monitor:
                     "sig_busy": self.sig_busy,
                     "defender_accessible": bool((art.get("defender") or {}).get("accessible")),
                     "ioc_version": iocs.IOC_VERSION,
+                    # ---- 受监控文件 / 目录（2026-10-07）----
+                    "watch_findings": len((self.watch_result or {}).get("findings") or []),
+                    "watch_busy": bool(getattr(self, "watch_busy", False)),
+                    # 重启后从本地安全日志还原的条目数。让它可见，
+                    # 用户才会知道"时间线里这几条是重启前的记录，不是刚发生的"。
+                    "alerts_from_log": getattr(self, "alerts_from_log", 0),
                 },
                 "security": {
                     "bind": self.bind_addr,
@@ -693,6 +1013,11 @@ class Monitor:
                                 # 已知项随 state 一起下发：前端 poll() 会整体替换 STATE，
                 # 单独 fetch 挂在 STATE 上的字段会被下一轮冲掉（实测踩过）。
                 "whitelist": whitelist.listing(),
+                # ⚠️ 必须随 state 一起下发：前端 poll() 是整体替换 STATE，
+                #    任何"单独 fetch 后挂在 STATE 上"的字段都会被下一轮冲掉（实测踩过）。
+                "watch": watch.listing(),
+                "watch_state": self.watch_result or {"findings": [], "targets": [], "stats": {}},
+                "auditlog": auditlog.stats(),
                 "net": net,
 "processes": self.procs,
                 "artifacts": af,
@@ -752,6 +1077,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Access-Control-Allow-Origin", "null")
+        self.send_header(
+            "Set-Cookie",
+            "yinhu-token=" + SESSION_TOKEN +
+            "; Path=/; SameSite=Strict; Max-Age=86400")
         if ctype.startswith("text/html"):
             # 加固：本地页面也加 CSP，即使将来前端出现注入点也无法执行外部脚本。
             self.send_header("Content-Security-Policy",
@@ -794,9 +1124,8 @@ class Handler(BaseHTTPRequestHandler):
         }.get(os.path.splitext(real)[1].lower(), "application/octet-stream")
         with open(real, "rb") as f:
             data = f.read()
-        # index.html 里注入本次会话的令牌（跨域页面读不到它 —— 没有 CORS 头）
-        if ctype.startswith("text/html"):
-            data = data.replace(b"__YINHU_TOKEN__", SESSION_TOKEN.encode("ascii"))
+        # 令牌不再注入静态 HTML（红队 F-01）：改由 _send 里的
+        # Set-Cookie(SameSite=Strict) 下发，避免被任意能读首页的本地进程直接 grep 到。
         self._send(200, data, ctype)
 
     def _body(self) -> dict | None:
@@ -826,25 +1155,58 @@ class Handler(BaseHTTPRequestHandler):
             if urlparse(origin).hostname not in ALLOWED_HOSTS:
                 self._json({"ok": False, "msg": "拒绝：请求来源不被允许"}, 403)
                 return False
+        _addr = getattr(self.server, "server_address", None)
+        my_port = _addr[1] if isinstance(_addr, (tuple, list)) and len(_addr) >= 2 else None
+
+        def _host_ok(hostval: str) -> bool:
+            h = (hostval or "").strip()
+            if not h:
+                return False
+            if h.startswith("["):                       # [::1]:8787
+                host = h.split("]")[0].lstrip("[").lower()
+                port = (h.split("]", 1)[1].lstrip(":") or "")
+            elif h.count(":") == 1:                     # 127.0.0.1:8787
+                host, port = h.rsplit(":", 1)
+                host = host.lower()
+            else:                                       # 裸主机名或畸形值
+                host, port = h.lower(), ""
+            if host not in ALLOWED_HOSTS:
+                return False
+            if my_port is not None and port:
+                try:
+                    if int(port) != int(my_port):
+                        return False
+                except ValueError:
+                    return False
+            return True
+
+        origin = self.headers.get("Origin")
+        if origin:
+            op = urlparse(origin)
+            oval = (f"{op.hostname}:{op.port}" if op.port
+                    else (op.hostname or ""))
+            if not _host_ok(oval):
+                self._json({"ok": False, "msg": "拒绝：请求来源不被允许"}, 403)
+                return False
         h = (self.headers.get("Host") or "").strip()
-        if h.startswith("["):                       # [::1]:8787
-            host = h.split("]")[0].lstrip("[").lower()
-        elif h.count(":") == 1:                     # 127.0.0.1:8787
-            host = h.rsplit(":", 1)[0].lower()
-        else:                                       # 裸主机名或畸形值
-            host = h.lower()
-        if host and host not in ALLOWED_HOSTS:
+        if h and not _host_ok(h):
             self._json({"ok": False, "msg": "拒绝：Host 不被允许"}, 403)
             return False
         return True
 
     def _guard(self) -> bool:
-        """POST 请求的四层来源校验。任一层不过直接 403。"""
-        # compare_digest 对含非 ASCII 的字符串抛 TypeError。
-        # 失败关闭没问题，但语义应是 403（令牌不对）而不是 500（服务端出错）。
+        """POST 来源校验：会话令牌（X-Yinhu-Token 头 或 SameSite Cookie）
+        + Origin/Host 同源（含端口）+ Content-Type。任一层不过直接 403。"""
+        req_tok = self.headers.get("X-Yinhu-Token") or ""
+        cookie_tok = ""
+        for _p in (self.headers.get("Cookie") or "").split(";"):
+            _k, _, _v = _p.partition("=")
+            if _k.strip() == "yinhu-token":
+                cookie_tok = _v.strip()
+                break
         try:
-            token_ok = hmac.compare_digest(self.headers.get("X-Yinhu-Token") or "",
-                                           SESSION_TOKEN)
+            token_ok = (hmac.compare_digest(req_tok, SESSION_TOKEN) or
+                        hmac.compare_digest(cookie_tok, SESSION_TOKEN))
         except TypeError:
             token_ok = False
         if not token_ok:
@@ -890,6 +1252,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(ioc_catalog())
         elif p == "/api/whitelist":
             self._json(whitelist.listing())
+        elif p == "/api/watch":
+            out = watch.listing()
+            out["state"] = getattr(self.monitor, "watch_result", {}) or {}
+            out["log"] = auditlog.stats()
+            self._json(out)
         elif p == "/api/net/flow":
             if m.netmon is None:
                 self._json({"error": "网络检测未启用"})
@@ -906,6 +1273,17 @@ class Handler(BaseHTTPRequestHandler):
                         "pid": os.getpid(), "secret": INSTANCE_SECRET})
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def do_OPTIONS(self):
+        # 显式拒绝跨源预检（红队 F-04 补充）：本服务仅允许同站点同源的 GET/POST，
+        # 不接受跨源请求。浏览器跨源非简单请求会先发 OPTIONS 预检，这里直接 405
+        # + ACAO:null，杜绝任何误放行。
+        self.send_response(405)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Allow", "GET, POST")
+        self.send_header("Access-Control-Allow-Origin", "null")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
 
     def do_POST(self):
         # 兜底：任何处理分支抛异常时，返回 JSON 错误而不是空响应。
@@ -957,6 +1335,35 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/integrity/accept":
             m.accept_integrity()
             self._json({"ok": True, "msg": "已按当前文件重建完整性基线"})
+        # ---------------- 受监控文件 / 目录（2026-10-07）----------------
+        elif p == "/api/watch/add":
+            ok, msg, t = watch.add(str(body.get("path") or ""),
+                                   bool(body.get("recursive", True)),
+                                   str(body.get("label") or ""))
+            if ok:
+                # 加完目标必须立刻建基线：否则下一轮比对会把"整个目标都是新增"
+                # 报成几百条 added 告警 —— 用户第一次用就会被自己的界面吓到。
+                try:
+                    watch.rebuild()
+                except Exception:
+                    pass
+                m.check_watch(force_full=True)
+                auditlog.write("config", "info", "新增受监控路径",
+                               f"{t.get('path')}（递归={'是' if t.get('recursive') else '否'}）")
+            self._json({"ok": ok, "msg": msg, "target": t})
+        elif p == "/api/watch/remove":
+            ok, msg = watch.remove(str(body.get("id") or ""))
+            if ok:
+                m.check_watch(force_full=True)
+                auditlog.write("config", "info", "移除受监控路径",
+                               str(body.get("id") or ""))
+            self._json({"ok": ok, "msg": msg})
+        elif p == "/api/watch/accept":
+            self._json(m.accept_watch())
+        elif p == "/api/watch/check":
+            threading.Thread(target=m._safe, args=(m.check_watch, True),
+                             daemon=True).start()
+            self._json({"ok": True, "msg": "已触发监控目标全量复核"})
         elif p == "/api/whitelist/suggest":
             pid = int(body.get("pid") or 0)
             rid = str(body.get("rule_id") or "")
@@ -1328,6 +1735,21 @@ _ARTIFACT_SECTION_ZH = {
 }
 
 
+def display_proc_name(p: dict) -> str:
+    """取进程的**可显示**名称。
+
+    受保护的内核/驱动宿主进程（如 PID 312）系统会拒绝读取 name，
+    psutil 返回空串。直接渲染就会在表格与报告里留下一格空白 ——
+    用户无法判断"这行是什么"，也不知道空白代表"读不到"而非"程序有问题"。
+    这里统一兜底成一句明确说明，与界面上的 name_unreadable 词条对应。
+    """
+    nm = (p or {}).get("name") or ""
+    if nm:
+        return nm
+    pid = (p or {}).get("pid")
+    return f"（进程名不可读 · PID {pid}）" if pid else "（进程名不可读）"
+
+
 def build_report_html(st: dict) -> str:
     """由一份 state 快照生成 HTML 报告。
 
@@ -1375,13 +1797,17 @@ def build_report_html(st: dict) -> str:
     # ---- 二、异常进程
     rows = []
     for p in b["procs"]:
+        # 一律用 .get + 兜底：报告是"事后取证"的载体，不能因为某个字段缺失
+        # 而生成出带 undefined/KeyError 的报告（KeyError 会让整个导出直接失败）。
+        _lv = p.get("level") or "clean"
         rows.append(
             "<tr>"
-            f"<td class='sev {p['level']}'>{rules.SEVERITY_ZH.get(p['level'],'')}</td>"
-            f"<td>{p['score']}</td><td>{p['pid']}</td><td>{esc(p['name'])}</td>"
-            f"<td class='path'>{esc(p['exe'])}</td>"
+            f"<td class='sev {_lv}'>{rules.SEVERITY_ZH.get(_lv,'')}</td>"
+            f"<td>{p.get('score') or 0}</td><td>{p.get('pid')}</td>"
+            f"<td>{esc(display_proc_name(p))}</td>"
+            f"<td class='path'>{esc(p.get('exe') or '')}</td>"
             f"<td>{esc(rules.sig_label(p))}</td>"
-            f"<td>{esc('；'.join(f['title'] for f in p['findings']))}</td>"
+            f"<td>{esc('；'.join(f['title'] for f in p.get('findings') or []))}</td>"
             "</tr>")
 
     # ---- 三、系统痕迹
@@ -1390,10 +1816,10 @@ def build_report_html(st: dict) -> str:
         kind = _KIND_ZH.get(a.get("kind", ""), a.get("kind", ""))
         arows.append(
             "<tr>"
-            f"<td class='sev {a['level']}'>{rules.SEVERITY_ZH.get(a['level'],'')}</td>"
-            f"<td>{a['score']}</td><td>{esc(kind)}</td><td>{esc(a['title'])}</td>"
+            f"<td class='sev {a.get('level') or 'clean'}'>{rules.SEVERITY_ZH.get(a.get('level') or 'clean','')}</td>"
+            f"<td>{a.get('score') or 0}</td><td>{esc(kind)}</td><td>{esc(a.get('title') or '')}</td>"
             f"<td class='path'>{esc(a.get('subtitle',''))}</td>"
-            f"<td>{esc('；'.join(f['title'] for f in a['findings']))}</td>"
+            f"<td>{esc('；'.join(f['title'] for f in a.get('findings') or []))}</td>"
             "</tr>")
 
     # ---- 四、网络外联
@@ -1405,7 +1831,7 @@ def build_report_html(st: dict) -> str:
         nrows.append(
             "<tr>"
             f"<td class='sev {cls}'>{badge}</td>"
-            f"<td>{f['score']:.0f}</td>"
+            f"<td>{float(f.get('score') or 0):.0f}</td>"
             f"<td>{esc(f['regularity'] if f['regularity'] is not None else '不可评估')}</td>"
             f"<td>{esc(f['avg_interval'] if f['avg_interval'] is not None else '—')}</td>"
             f"<td>{f['pid']}</td><td>{esc(f['name'])}</td>"
@@ -1441,33 +1867,39 @@ def build_report_html(st: dict) -> str:
                     "<p>本次未启用网络检测。</p>")
 
     # ---- 五、高危项详情（进程 + 系统痕迹，与上面的计数同源）
+    # ⚠️ 这里的每一项都必须用 .get 取：报告是"事后取证"的载体，
+    #    它的正确性不能依赖"上游一定填好了 findings/level/score"。
+    #    2026-10-08 回归用例实测：进程缺 findings 键时 p["findings"] 抛 KeyError，
+    #    整个导出直接失败 —— 而用户点"导出报告"往往正是为了留证据。
     detail_blocks = []
     for p in b["procs"]:
-        if p["level"] not in ("critical", "high"):
+        if (p.get("level") or "clean") not in ("critical", "high"):
             continue
         items = "".join(
-            f"<li><b>[{f['rule_id']}] {esc(f['title'])}</b>"
-            f"<div class='ev'>{esc(f['evidence'])}</div>"
-            f"<div class='ad'>{esc(f['advice'])}</div></li>"
-            for f in p["findings"])
+            f"<li><b>[{esc(f.get('rule_id') or '')}] {esc(f.get('title') or '')}</b>"
+            f"<div class='ev'>{esc(f.get('evidence') or '')}</div>"
+            f"<div class='ad'>{esc(f.get('advice') or '')}</div></li>"
+            for f in (p.get("findings") or []))
+        _plv = p.get("level") or "clean"
         detail_blocks.append(
-            f"<div class='card'><h3>{esc(p['name'])} <span class='pid'>进程 · PID {p['pid']}</span>"
-            f"<span class='sev {p['level']}'>{rules.SEVERITY_ZH.get(p['level'],'')} · {p['score']}分</span></h3>"
-            f"<div class='path'>{esc(p['exe'])}</div>"
-            f"<div class='path'>命令行：{esc(p['cmdline_str'][:300])}</div>"
+            f"<div class='card'><h3>{esc(display_proc_name(p))} <span class='pid'>进程 · PID {p.get('pid')}</span>"
+            f"<span class='sev {_plv}'>{rules.SEVERITY_ZH.get(_plv,'')} · {p.get('score') or 0}分</span></h3>"
+            f"<div class='path'>{esc(p.get('exe') or '')}</div>"
+            f"<div class='path'>命令行：{esc((p.get('cmdline_str') or '')[:300])}</div>"
             f"<ul>{items}</ul></div>")
     for a in b["arts"]:
-        if a["level"] not in ("critical", "high"):
+        if (a.get("level") or "clean") not in ("critical", "high"):
             continue
         items = "".join(
-            f"<li><b>[{f['rule_id']}] {esc(f['title'])}</b>"
-            f"<div class='ev'>{esc(f['evidence'])}</div>"
-            f"<div class='ad'>{esc(f['advice'])}</div></li>"
-            for f in a["findings"])
+            f"<li><b>[{esc(f.get('rule_id') or '')}] {esc(f.get('title') or '')}</b>"
+            f"<div class='ev'>{esc(f.get('evidence') or '')}</div>"
+            f"<div class='ad'>{esc(f.get('advice') or '')}</div></li>"
+            for f in (a.get("findings") or []))
         kind = _KIND_ZH.get(a.get("kind", ""), a.get("kind", ""))
+        _alv = a.get("level") or "clean"
         detail_blocks.append(
-            f"<div class='card'><h3>{esc(a['title'])} <span class='pid'>系统痕迹 · {esc(kind)}</span>"
-            f"<span class='sev {a['level']}'>{rules.SEVERITY_ZH.get(a['level'],'')} · {a['score']}分</span></h3>"
+            f"<div class='card'><h3>{esc(a.get('title') or '')} <span class='pid'>系统痕迹 · {esc(kind)}</span>"
+            f"<span class='sev {_alv}'>{rules.SEVERITY_ZH.get(_alv,'')} · {a.get('score') or 0}分</span></h3>"
             f"<div class='path'>{esc(a.get('subtitle',''))}</div>"
             f"<ul>{items}</ul></div>")
 

@@ -59,9 +59,31 @@ def finding(rid: str, title: str, severity: str, weight: int,
 
 
 def score_findings(fs: list[dict]) -> tuple[float, str]:
+    """把一组 finding 折算成 (总分, 等级)。
+
+    ⚠️ 本函数**保证不抛异常** —— 这是刻意的设计约束，不是顺手写的防御。
+    2026-10-08 实测：`_store_mod_scan` 存回深度扫描结论时漏掉了 weight 字段，
+    于是这里 `f["weight"]` 抛 KeyError；异常从调用方 `_score_all()` 的 for 循环
+    里逃逸，**循环剩下的进程全部没被评分**（276 个进程里 156 个没有 score/level），
+    界面风险列显示 undefined、标签页计数恒为 0。
+
+    一条畸形 finding 绝不能让整张进程表失明 —— 评分是显示层的基础设施，
+    它必须比规则本身更耐用。因此：
+      · 用 .get 取 weight，缺失按 0 计（该条不影响分数，但仍留在 findings 里可见）；
+      · 非数值（字符串 / None）同样按 0 计，不抛 TypeError；
+      · 全部取不到时退回 (0.0, "clean")，而不是报错。
+    """
     if not fs:
         return 0.0, "clean"
-    weights = sorted((f["weight"] for f in fs), reverse=True)
+    weights: list[float] = []
+    for f in fs:
+        try:
+            weights.append(float(f.get("weight", 0) or 0))
+        except (TypeError, ValueError):
+            weights.append(0.0)
+    weights.sort(reverse=True)
+    if not weights:
+        return 0.0, "clean"
     total = weights[0] + 0.35 * sum(weights[1:])
     total = min(100.0, round(total, 1))
     if total >= 80:
@@ -480,6 +502,17 @@ def is_own_aux_process(proc: dict, ctx: dict) -> bool:
 
 def rules_process(proc: dict, ctx: dict) -> list[dict]:
     fs: list[dict] = []
+
+    # 排除本工具**自身**进程。
+    # 2026-10-08 实测：监视器实际运行在
+    #   %LOCALAPPDATA%\Programs\<workspace>AI\resources\vendor\python\pythonw.exe
+    # （venv 的 base 解释器就是它），于是自己的进程被 P006 判成
+    # "未签名程序运行于用户目录"（medium 34）。
+    # 一个安全工具报告自己，是纯噪音，还会让用户怀疑整份检测结果的可信度。
+    # is_own_aux_process 只覆盖"自己拉起的子进程"，覆盖不到自身，故这里单独判一次。
+    # 注意：只是不打分，进程仍留在表格里（显示为"正常"），不是隐身。
+    if ctx.get("self_pid") and proc.get("pid") == ctx["self_pid"]:
+        return fs
 
     # 排除本工具自己拉起的辅助进程。
     # 签名校验会调用 PowerShell（-EncodedCommand），这些子进程的命令行天然带高危特征；
@@ -1432,14 +1465,14 @@ def rules_filesystem(art: dict, max_files: int = 4000) -> list[dict]:
 # 深度扫描 —— 针对高风险进程检查加载模块（白加黑 / IOC DLL）
 # ================================================================
 
-def deep_scan_process(proc: dict, ctx: dict, treat_unknown_as_bad: bool = False):
+def deep_scan_process(proc: dict, ctx: dict):
     """针对高风险进程检查加载模块（白加黑 / IOC DLL / 伪装扩展名）。
 
     返回 (findings, pending_sig_paths)：
       pending_sig_paths —— 尚未做签名校验的模块路径，由 server 排队校验。
-      未校验完成前不据此定罪（宁漏勿冤），下次签名批次完成后再复查。
+      **未校验完成前绝不定罪（宁漏勿冤）**，server 会在签名批次完成后复查该进程。
 
-    ⚠️ 两条实测踩出来的规则：
+    ⚠️ 三条实测踩出来的规则：
     1. **必须按规则聚合，不能每个模块产出一条 finding。**
        初版对每个可疑 DLL 各加一条 X003，pwsh.exe 一次加载 15 个同目录 DLL
        就叠加成 15 条 × 82 分 → 分数直接顶到 100，判成"严重"。
@@ -1447,6 +1480,28 @@ def deep_scan_process(proc: dict, ctx: dict, treat_unknown_as_bad: bool = False)
        这类应用的 DLL 由包签名整体保护，**不单独做 Authenticode 签名**。
        实测 pwsh.exe（PowerShell 7，装在 D:\\WindowsApps\\Microsoft.PowerShell_*）
        因此被误判为白加黑。合法应用极少从 WindowsApps 之外加载未签名同目录 DLL。
+    3. **「尚未校验」永远不等于「可疑」**（2026-10-08 修复，代价很大，见下）。
+
+    ## 为什么删掉了 treat_unknown_as_bad
+
+    2026-10-08 实测：本函数原有一个 `treat_unknown_as_bad=True` 分支，
+    在"重试若干次仍未验出"时把未校验的 DLL 直接计入 sideload（定罪）。
+
+    后果是**一次大规模的误报**：`verify_signatures` 实测约 **297 ms/文件**，
+    首次运行时签名校验队列积压 647 个文件（≈3 分钟才能排空）；而调用方
+    `server._deep_scan_cycle` 的"重试 4 次"只等于 **约 4 秒**。
+    4 秒远小于 3 分钟 → 计时器先到期 → 强行定罪。
+
+    实测被定罪的有：Edge、微信、<workspace>、网易 UU 远程、Intel DSA ——
+    共 48 个同目录 DLL，**逐个复验全部为「签名有效」**
+    （Microsoft / Intel / Tencent / NetEase 签发）。
+    这些进程因此被判 critical(82)，并连带触发 N005（高风险进程持有对外连接）
+    把它们的正常 HTTPS 流量再报一遍，界面上"一片爆红"。
+
+    教训：**"没验完"是校验系统的状态，不是被检对象的属性。**
+    拿计时器去猜"验完了没有"，猜错就是把整台机器的正规软件全判成木马。
+    正确做法是让调用方在签名结果到达后**复查**（见 server._sig_worker 的
+    _deep_pending 释放逻辑），而不是在这里靠超时兜底。
     """
     import collector
     fs: list[dict] = []
@@ -1477,7 +1532,7 @@ def deep_scan_process(proc: dict, ctx: dict, treat_unknown_as_bad: bool = False)
         if ext in iocs.DISGUISED_EXTENSIONS and collector.file_magic(mp) == "PE":
             disguised_mods.append(mp)
 
-        # 白加黑：模块位于进程自身目录（非系统目录）且签名不可信
+        # 白加黑：模块位于进程自身目录（非系统目录）且**签名校验结果确认不可信**
         if own_dir and nmp.startswith(own_dir) and ext == ".dll":
             if "\\windowsapps\\" in nmp or "\\windowsapps\\" in own_dir:
                 continue          # MSIX / Store 应用：DLL 由包签名保护，跳过
@@ -1485,13 +1540,8 @@ def deep_scan_process(proc: dict, ctx: dict, treat_unknown_as_bad: bool = False)
                 continue
             sig = ctx["sig_cache"].get(mp.lower())
             if sig is None:
-                # 加固：初版把"还没校验"的 DLL 一律当可疑（sig is None → sideload），
-                # 而模块路径从未进入签名校验队列 —— 等于对所有同目录 DLL 无差别指控。
-                # 现在改为：排队校验，校验完成前不定罪。
-                if treat_unknown_as_bad:
-                    sideload.append(mp)
-                else:
-                    pending_sigs.append(mp)
+                # 排队校验，**校验完成前不定罪**。调用方负责在结果到达后复查。
+                pending_sigs.append(mp)
             elif sig.get("kind") in UNTRUSTED_KINDS:
                 sideload.append(mp)
 
@@ -1509,14 +1559,39 @@ def deep_scan_process(proc: dict, ctx: dict, treat_unknown_as_bad: bool = False)
     if sideload:
         hint = any(os.path.basename(s).lower() in
                    [h.lower() for h in iocs.SIDELOAD_DLL_HINTS] for s in sideload)
+        # ⚠️ 严重度标定（2026-10-08 修正）：
+        #   命中侧加载提示名单（wjcapture.dll / version.dll / libcurl.dll 等经典
+        #   劫持名）→ critical 92：这是高精度信号，维持原判。
+        #   普通「同目录未签名 DLL」→ **medium 45**（原为 high 82）。
+        #
+        #   为什么必须降：netmon.py 的 mod_strong 早已写明
+        #     mod_strong = mod_ioc or mod_disguised or (mod_sideload and mod_level == "critical")
+        #   注释原话是"强信号才自动升级网络风险，**避免把「绿色软件自带未签名 DLL」
+        #   误判为高危**"。也就是说网络侧已经把这类情况定性为弱信号，
+        #   而进程侧却给它判 high(82) —— 同一份代码里两处标定自相矛盾。
+        #
+        #   实测依据：D:\Steam 下 24 个 DLL 有 23 个由 Valve/Nvidia/Microsoft 签名，
+        #   仅 libpyrowave-shared-0.dll 未签名。按原标定，steam.exe 只要运行就被判
+        #   critical(82)，再经 N005 把它的正常联机流量报成"疑似 C2 心跳"共 9 条。
+        #   正规软件自带个别未签名 DLL 是常态（规则自己的建议文案就写着"属正常现象"），
+        #   把它判成"严重"等于让整页失去焦点 —— 违背项目"宁可少报，不可误报成灾"的取向。
+        #
+        #   检出能力并未丢失：真正的白加黑载荷进程必然要回连 C2，
+        #   此时 N006（白加黑侧加载进程持有公网连接，high 80）仍会升级，
+        #   而它同样只在 mod_level == "critical"（即命中提示名单）时才触发。
         fs.append(finding(
             "X003", f"疑似白加黑侧加载（{len(sideload)} 个同目录未签名 DLL"
                     f"{'，命中侧加载提示名单' if hint else ''}）",
-            "critical" if hint else "high", 92 if hint else 82, "process",
+            "critical" if hint else "medium", 92 if hint else 45, "process",
             f"{proc['name']} 从自身目录（{proc.get('dir','')}）加载了 "
             f"{len(sideload)} 个未签名 / 签名异常的 DLL：\n" +
             "\n".join(sideload[:6]) + (f"\n… 另有 {len(sideload)-6} 个" if len(sideload) > 6 else ""),
-            "银狐核心手法：用带有效签名的合法程序（白文件）从自身目录加载恶意 DLL"
-            "（黑文件），形成「白加黑」。请核对该 DLL 的来源与签名。"
-            "若该程序是你自行安装的开源/绿色软件，其自带 DLL 未签名属正常现象。"))
+            ("银狐核心手法：用带有效签名的合法程序（白文件）从自身目录加载恶意 DLL"
+             "（黑文件），形成「白加黑」。该 DLL 命中侧加载提示名单，请立即核对其来源与签名。"
+             if hint else
+             "银狐核心手法：用带有效签名的合法程序从自身目录加载恶意 DLL，形成「白加黑」。"
+             "但**大量正规软件（Steam、绿色版工具等）本就自带个别未签名 DLL，属正常现象**，"
+             "因此本条只作中危提示。请核对：① 该 DLL 是否为该软件自带（看安装包/版本目录）；"
+             "② 该软件近期是否有异常外联（网络页会给出结论）。"
+             "确认无误后可在「安全状态 → 已知项」中一键忽略。")))
     return fs, pending_sigs

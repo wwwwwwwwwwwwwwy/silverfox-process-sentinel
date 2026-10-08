@@ -80,7 +80,22 @@ def _cache_put(d: dict, k, v):
 #   2. cmdline 按 (pid, create_time) 缓存，每个进程一生只取一次；
 #      每轮只允许花掉一个时间预算，避免新进程爆发时卡住主循环
 #   3. num_threads / status 挪到详情视图按需获取（status 原本根本没被用到）
-FAST_ATTRS = ["pid", "ppid", "name", "exe", "username", "create_time", "memory_info"]
+FAST_ATTRS = ["pid", "ppid", "name", "exe", "username", "create_time"]
+# ⚠️ FAST_ATTRS 里**不允许**再出现 memory_info / num_threads / status / cmdline。
+#    2026-10-07 实测（本机 344 个进程，非管理员）：每轮快照的耗时构成是
+#        pid/name/exe/create_time  约 2 ms
+#        ppid                      约 31 ms
+#        username                  约 46 ms
+#        memory_info            约 1470 ms   ← 元凶
+#        cpu_times（cpu_percent 内部调用）约 1270 ms  ← 元凶
+#        num_threads            约 2280 ms
+#    而 memory_info 与 cpu 这两个字段**全项目只有详情抽屉用到**
+#    （web/app.js 的 kv_cpu 一行，数据来自 /api/detail）。
+#    它们和当初的 num_threads / status 完全同类：贵、而且大部分时间没人看。
+#    留在每轮快照里，单轮扫描就从 ~0.3 秒变成 ~3.3 秒 ——
+#    这正是用户抱怨"扫描速度太慢"的真实根因（改扫描间隔没有用，
+#    scan 本身就要 3.3 秒，间隔再小也塞不进去）。
+#    现在它们改由 enrich_process() 在用户点开某个进程时按需取。
 
 CMD_BUDGET_COLD = 3.0     # 冷启动：一次把存量进程的命令行尽量取完
 CMD_BUDGET_WARM = 0.25    # 稳态：每轮最多花 250 ms 补命令行
@@ -241,11 +256,8 @@ def collect_processes(sig_cache: dict[str, dict] | None = None) -> list[dict]:
             else:
                 cmd = []
 
-        mi = info.get("memory_info")
-        try:
-            cpu = p.cpu_percent(interval=None)
-        except Exception:
-            cpu = 0.0
+        mi = None          # 见 FAST_ATTRS 上方注释：内存/CPU 不在每轮快照里取
+        cpu = 0.0          # 详情抽屉打开时由 enrich_process() 现取
 
         # 没有可执行文件的进程（PID 0 Idle / 4 System / 308 Secure System 等
         # 内核伪进程与 VBS 隔离组件）**根本没有镜像文件**，签名无从校验。
@@ -329,11 +341,14 @@ def collect_net_map() -> dict[int, list[dict]]:
 
 
 def enrich_process(pid: int) -> dict:
-    """详情视图的深度信息：加载模块、打开文件、线程数、状态。
-    num_threads / status 采集成本高（各 ~1.2–1.3 s/300 进程），因此不放进每轮快照，
-    只在用户点开某个进程时按需取。"""
+    """详情视图的深度信息：加载模块、打开文件、线程数、状态、内存、CPU 占用。
+
+    这些字段采集成本高（num_threads 约 2.3 s/344 进程、memory_info 约 1.5 s、
+    status 约 1.2 s），因此**不放进每轮快照**，只在用户点开某个进程时按需取。
+    2026-10-07 把 memory_info 与 cpu 也一并挪了进来 —— 本轮前它们还在快照里，
+    是全项目最贵的两个字段，而全部用处只有详情抽屉里那一行。"""
     out: dict[str, Any] = {"modules": [], "open_files": [], "threads": 0,
-                           "status": "", "error": ""}
+                           "status": "", "rss_mb": 0, "cpu": 0.0, "error": ""}
     try:
         p = psutil.Process(pid)
     except Exception as e:
@@ -345,6 +360,18 @@ def enrich_process(pid: int) -> dict:
         pass
     try:
         out["status"] = p.status()
+    except Exception:
+        pass
+    try:
+        out["rss_mb"] = round(p.memory_info().rss / 1048576, 1)
+    except Exception:
+        pass
+    try:
+        # ⚠️ 必须给 interval。psutil 的 cpu_percent 是"两次采样的差值"，
+        #    首次调用没有基准值可比较，只会返回 0.0 并建立基准 ——
+        #    写成 cpu_percent() 会永远显示 0%。给 0.1 秒是这里唯一的阻塞，
+        #    只发生在"用户点开一个进程"时；放回每轮扫描则要阻塞 300+ 次。
+        out["cpu"] = round(p.cpu_percent(interval=0.1), 1)
     except Exception:
         pass
     try:

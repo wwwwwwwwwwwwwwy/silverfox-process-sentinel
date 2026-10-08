@@ -124,9 +124,11 @@ def main():
                     help="不自动打开界面窗口（只起服务，自己用浏览器访问）")
     ap.add_argument("--verify-only", action="store_true",
                     help="只做程序文件完整性校验然后退出，不启动监视器")
-    ap.add_argument("--proc-interval", type=float, default=3.0, metavar="秒",
-                    help="进程扫描间隔，默认 3 秒。调大会降低 CPU 占用，"
-                         "但存活时间短于该间隔的进程会漏掉")
+    ap.add_argument("--proc-interval", type=float,
+                    default=server.Monitor.PROC_INTERVAL_DEFAULT, metavar="秒",
+                    help="进程扫描间隔，默认 1 秒（2026-10-07 由 3 秒调快）。"
+                         "调到 0.2 约等于背靠背连续扫描；"
+                         "调大会降低 CPU 占用，但存活时间短于该间隔的进程会漏掉")
     ap.add_argument("--artifact-interval", type=float, default=180.0, metavar="秒",
                     help="系统制品（计划任务/服务/驱动/启动项/Defender 排除项）扫描间隔，"
                          "默认 180 秒。这类东西变化很慢，调小意义不大且明显增加磁盘读")
@@ -186,7 +188,7 @@ def main():
         sys.exit(1)
 
     srv, monitor = server.serve(args.host, port,
-                                  proc_interval=max(0.5, args.proc_interval),
+                                  proc_interval=max(0.2, args.proc_interval),
                                   artifact_interval=max(10.0, args.artifact_interval),
                                   net_interval=max(0.4, args.net_interval),
                                   net_duration=max(5.0, args.net_duration),

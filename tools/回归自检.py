@@ -169,7 +169,44 @@ seg_col = src_col[src_col.find("def collect_net_map"):src_col.find("def collect_
 check("全局连接表保留 LISTEN（P025 才不是死规则）", "LISTEN" in seg_col)
 
 # X003 不把"未校验"当可疑
+# ⚠️ 旧断言是 `"sig is None or" not in src_rules` —— 它只否掉了一种**写法**，
+#    而 2026-10-08 的缺陷恰恰绕过了它：定罪逻辑被写成
+#    `if treat_unknown_as_bad: sideload.append(mp)`，源码里没有 "sig is None or"
+#    这个字面量，于是测试一路绿灯，误报却把 Edge / 微信 / <workspace> 全判成了严重。
+#    教训：**断言"某段代码不存在"时，必须断言那个"行为开关"不存在，
+#    而不是它某一种可能的长相。** 真正的守卫在下面的 F-021（行为层）。
 check("X003 不把「签名未校验」当可疑依据", "sig is None or" not in src_rules)
+
+
+def _uses_identifier(src: str, name: str) -> bool:
+    """源码里是否**真的使用了**某个标识符（忽略注释与文档字符串）。
+
+    为什么不用 `name in src` 这种子串判断：本文件上一版就是这么写的，
+    结果连"注释里解释为什么删掉它"都会被判成违规 —— 一个只会产生假警报的断言，
+    最后必然被人随手注释掉，等于没有。改用 AST：只看真实的
+    参数声明(arg)、关键字实参(keyword)、名字(Name)与属性(Attribute)。
+    解析失败时返回 True（fail-closed），避免"语法坏了反而检查通过"。
+    """
+    import ast as _ast
+    try:
+        tree = _ast.parse(src)
+    except SyntaxError:
+        return True
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Name) and node.id == name:
+            return True
+        if isinstance(node, _ast.arg) and node.arg == name:
+            return True
+        if isinstance(node, _ast.keyword) and node.arg == name:
+            return True
+        if isinstance(node, _ast.Attribute) and node.attr == name:
+            return True
+    return False
+
+
+check("X003 不存在「未校验即定罪」的旁路开关（AST 层面）",
+      not _uses_identifier(src_rules, "treat_unknown_as_bad")
+      and not _uses_identifier(src_srv, "treat_unknown_as_bad"))
 
 
 # 6. 回环连接不得被当成"外联"
@@ -607,7 +644,13 @@ for _pid in sorted(_new_own):
 # 下次扫描就会把它报成高危。用 Job Object 的 KILL_ON_JOB_CLOSE 从根上解决。
 # 辅助进程用 os._exit(0) 直接终止（模拟"被强制结束"，不跑任何清理代码）。
 import subprocess as _sp  # noqa: E402
-_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_orphan_helper.py")
+# ⚠️ 辅助脚本必须写在**临时目录**，不能写在程序目录旁边。
+#    2026-10-07 实测：程序目录按 README 第 9.7 节收紧为「仅管理员可写」之后，
+#    这里会直接抛 PermissionError，**整个自检跑到一半崩掉**。
+#    也就是说：脚本原本与它自己推荐的加固措施互相矛盾 ——
+#    加固一做，普通用户就再也跑不了自检。改放临时目录后两者不再冲突。
+import tempfile as _tf          # noqa: E402
+_HELPER = os.path.join(_tf.gettempdir(), "yh_orphan_helper.py")
 _HLOG = _HELPER + ".log"
 io.open(_HELPER, "w", encoding="utf-8").write(
     "# -*- coding: utf-8 -*-\n"
@@ -1317,6 +1360,325 @@ check("F-003 非有限时长明确拒绝", 'not math.isfinite(duration)' in _nm
       and '"bad": True' in _nm)
 check("F-019 compare 对上标数字不抛异常",
       isinstance(_v.compare("2026.10.05\u00b2", "2026.10.05"), int))
+
+
+# ================================================================
+# 16. 2026-10-07：把「文本断言」换成「真执行断言」
+#
+# 起因：上面那条 F-003 只做**源码文本匹配**（源码里写着 math.isfinite 就算过）。
+# 而真机上的 bug 恰恰是：netmon.py 用了 math.isfinite，却**没有 import math** ——
+# set_duration() 一被调用就 NameError，接口回 500。
+# 用户看到的现象是「观测时长滑块拖一下就报错」，功能整个废掉。
+#
+# 文本断言永远测不出「名字写对了、但根本跑不起来」这一类问题；
+# 这正是本工具自己在第 16 条陷阱里写下的教训：
+# **凡是能用行为验证的，就不要用文本匹配。**
+# ================================================================
+
+try:
+    _nmo = netmon.NetMonitor()
+    _r_ok = _nmo.set_duration(1800)
+    _r_inf = _nmo.set_duration(float("inf"))
+    _r_nan = _nmo.set_duration(float("nan"))
+    check("时长：set_duration 真的能跑（不是只写着）",
+          _r_ok.get("ok") is True and _r_ok.get("duration") == 1800.0,
+          f"返回 {_r_ok}")
+    check("时长：非有限值返回 bad 而不是抛异常",
+          _r_inf.get("bad") is True and _r_nan.get("bad") is True)
+except Exception as _e:      # noqa: BLE001
+    check(f"时长：set_duration 真的能跑（异常 {type(_e).__name__}: {_e}）", False)
+
+check("时长：档位上限已放宽到 30 分钟（1800 秒）",
+      1800 in netmon.DURATION_STOPS and max(netmon.DURATION_STOPS) == 1800,
+      f"当前档位 {netmon.DURATION_STOPS}")
+
+# ---- 扫描节奏：热路径里不能出现贵字段 -------------------------------
+# memory_info / num_threads 留在每轮快照里，会让单轮扫描从 ~0.14 秒涨到 ~3.3 秒
+# （本机实测），而它们全项目只有详情抽屉用到。这条断言防止有人"顺手加回来"。
+#
+# ⚠️ 这里必须拿**模块对象**，不能拿源码文本 —— 本文件上方 `_col` 已被
+#    赋成 collector.py 的源码字符串（文本断言用），拿它取属性会 AttributeError。
+#    而条断言本身就是要"真执行"，所以老老实实 import 一次模块。
+import importlib as _il          # noqa: E402
+_colmod = _il.import_module("collector")
+check("扫描：FAST_ATTRS 不含 memory_info / num_threads / status / cmdline",
+      not ({"memory_info", "num_threads", "status", "cmdline"} & set(_colmod.FAST_ATTRS)),
+      f"当前 {_colmod.FAST_ATTRS}")
+check("扫描：详情路径 enrich_process 会现取内存与 CPU",
+      "memory_info" in __import__("inspect").getsource(_colmod.enrich_process)
+      and "cpu_percent" in __import__("inspect").getsource(_colmod.enrich_process))
+
+# ---- 缓存：describe() 不能每次都在磁盘上做写探测 ---------------------
+# 真实探测是「建文件→写→删」，本机实测 ~450 ms/次（被杀软实时扫描拦一道）。
+# describe() 被 /api/state 每次轮询调用 —— 不缓存就等于界面每秒卡半秒。
+try:
+    import paths as _paths   # noqa: E402
+    _t0 = time.perf_counter()
+    _paths._writable(_paths.DATA_DIR)           # 一次真实探测
+    _uncached = time.perf_counter() - _t0
+    _paths.describe()                           # 先预热，否则第一次调用本身就是探测
+    _t0 = time.perf_counter()
+    for _ in range(20):
+        _paths.describe()
+    _cached = time.perf_counter() - _t0
+    check("缓存：describe() 走缓存（20 次调用快于 1 次真实探测）",
+          _cached < max(_uncached, 0.002),
+          f"20 次 {_cached*1000:.2f} ms vs 单次探测 {_uncached*1000:.1f} ms")
+except Exception as _e:      # noqa: BLE001
+    check(f"缓存：describe() 走缓存（异常 {type(_e).__name__}: {_e}）", False)
+
+# ---- 日志：附加字段不允许覆盖核心字段 -------------------------------
+# 曾经写成 **kwargs，调用方传 kind=... 会与第一个形参撞名，
+# 整条 auditlog.write 抛 TypeError 又被自身的 try 吞掉 ——
+# 表现为「告警正常出现、日志里却什么都没有」，极难发现。
+try:
+    import auditlog as _alog   # noqa: E402
+    # ⚠️ kind 用 "selftest" 而不是 "watch"：
+    #    server._restore_alerts_from_log() 会把 watch / integrity / whitelist
+    #    这三类日志**还原成告警时间线**。自检若写成 watch，
+    #    用户下次启动就会看到一条凭空出现的假告警。
+    _alog.write("selftest", "medium", "回归自检探针", "不应影响核心字段",
+                extra={"kind": "changed", "file": "x"})
+    _rec = next((r for r in reversed(_alog.tail(8))
+                 if r.get("title") == "回归自检探针"), None)
+    check("日志：附加字段不会覆盖 kind（撞名不再致命）",
+          _rec is not None and _rec.get("kind") == "selftest"
+          and _rec.get("file") == "x",
+          f"写入结果 {_rec}")
+except Exception as _e:      # noqa: BLE001
+    check(f"日志：附加字段不会覆盖 kind（异常 {type(_e).__name__}: {_e}）", False)
+
+# ---- 受监控文件：改动 / 新增 / 删除三种情况都要能检出 -----------------
+try:
+    import shutil as _sh
+    import watch as _watch   # noqa: E402
+    _tmp = os.path.join(tempfile.gettempdir(), "yh_regress_watch")
+    _sh.rmtree(_tmp, ignore_errors=True)
+    os.makedirs(_tmp, exist_ok=True)
+    for _fn, _txt in (("a.txt", "one"), ("b.txt", "two")):
+        with open(os.path.join(_tmp, _fn), "w", encoding="utf-8") as _f:
+            _f.write(_txt)
+    # 先存盘自检前的配置与基线，测完还原 ——
+    # 测试脚本不得改动被测对象的真实配置（第 25 条陷阱踩过）
+    _saved_cfg = _watch.load()
+    _saved_base = _watch.load_baseline()
+    _ok, _msg, _tg = _watch.add(_tmp, recursive=True, label="回归自检")
+    _watch.rebuild()
+    check("受监控文件：刚建完基线时零差异",
+          _watch.verify(force_full=True)["stats"]["total"] == 0)
+    with open(os.path.join(_tmp, "a.txt"), "w", encoding="utf-8") as _f:
+        _f.write("one-changed")
+    with open(os.path.join(_tmp, "c.txt"), "w", encoding="utf-8") as _f:
+        _f.write("three")
+    os.remove(os.path.join(_tmp, "b.txt"))
+    _res = _watch.verify(force_full=True)
+    _kinds = sorted(f["kind"] for f in _res["findings"])
+    check("受监控文件：改 / 增 / 删 三种都能检出",
+          _kinds == ["added", "changed", "removed"], f"检出 {_kinds}")
+    if _tg:
+        _watch.remove(_tg["id"])
+    _watch.save(_saved_cfg)
+    _watch.save_baseline(_saved_base)
+    _sh.rmtree(_tmp, ignore_errors=True)
+except Exception as _e:      # noqa: BLE001
+    check(f"受监控文件：改 / 增 / 删 三种都能检出（异常 {type(_e).__name__}: {_e}）",
+          False)
+
+
+print()
+print("=" * 72)
+print("F-020 评分链路健壮性 —— 一条畸形 finding 不得让整张进程表失明")
+print("=" * 72)
+
+# 背景（2026-10-08 实测缺陷）：
+#   _store_mod_scan 存回深度扫描结论时白名单式挑字段，**漏掉了 weight**。
+#   这些残缺 finding 被 _score_all 并回进程后交给 score_findings()，
+#   后者读 f["weight"] 抛 KeyError；异常从 _score_all 的 for 循环中逃逸，
+#   于是该进程之后的**所有进程都没有 score/level**。
+#   实测后果：276 个进程里 156 个缺字段，界面风险列渲染出 undefined、
+#   标签页计数恒为 0，服务端每 1 秒打印一次 traceback。
+# 本组用例把三层防线（score_findings 容错 / _store_mod_scan 保字段 /
+# _score_all 逐进程隔离）全部固化，防止再次回归。
+
+# 1. score_findings 对畸形 finding 必须不抛异常
+try:
+    _s1, _l1 = rules.score_findings([{"rule_id": "X999", "title": "残缺", "severity": "high"}])
+    check("F-020 score_findings 对缺 weight 的 finding 不抛异常", True, f"→ ({_s1}, {_l1})")
+except Exception as _e:      # noqa: BLE001
+    check(f"F-020 score_findings 对缺 weight 的 finding 不抛异常（{type(_e).__name__}: {_e}）",
+          False)
+
+try:
+    _s2, _l2 = rules.score_findings([{"weight": "heavy"}, {"weight": None}])
+    check("F-020 score_findings 对非数值 weight 不抛异常", True, f"→ ({_s2}, {_l2})")
+except Exception as _e:      # noqa: BLE001
+    check(f"F-020 score_findings 对非数值 weight 不抛异常（{type(_e).__name__}: {_e}）",
+          False)
+
+# 2. 容错不能改坏正常评分：权重模型必须原样保持
+_w95 = rules.finding("P001", "伪装系统进程", "critical", 95, "process", "ev")
+_w30 = rules.finding("P007", "随机名程序", "medium", 30, "process", "ev")
+_w60 = rules.finding("P005", "未签名外联", "high", 60, "process", "ev")
+check("F-020 单条正常 finding 的评分不变",
+      rules.score_findings([_w95]) == (95.0, "critical"),
+      f"→ {rules.score_findings([_w95])}")
+# 用不会触及 100 分封顶的组合，才能验证"最高权重 + 0.35×其余"这个模型本身
+check("F-020 多条 finding 的加权模型不变（最高 + 0.35×其余）",
+      rules.score_findings([_w60, _w30]) == (60.0 + 0.35 * 30, "high"),
+      f"→ {rules.score_findings([_w60, _w30])}")
+check("F-020 总分仍封顶 100",
+      rules.score_findings([_w95, _w30])[0] == 100.0,
+      f"→ {rules.score_findings([_w95, _w30])}")
+
+# 3. 行为测试：真实 Monitor 上跑一遍"深扫结论并回评分"的完整链路
+try:
+    import traceback as _tb
+    import server as _srv   # noqa: E402
+
+    _m = _srv.Monitor(net_enabled=False)
+    _p1 = mk("a.exe", r"C:\Windows\a.exe")
+    _p2 = mk("b.exe", r"C:\Windows\b.exe")     # 这条会被写入深度扫描结论
+    _p3 = mk("c.exe", r"C:\Windows\c.exe")
+    _p1["pid"], _p2["pid"], _p3["pid"] = 1, 2, 3   # mk() 默认 pid 都是 4242，必须区分开
+    _m.procs = [_p1, _p2, _p3]
+
+    _m._store_mod_scan((_p2["pid"], _p2["create_time"]),
+                       [rules.finding("X003", "白加黑侧加载", "critical", 90, "process", "ev")])
+    _stored = _m.mod_scan[(_p2["pid"], _p2["create_time"])]["findings"][0]
+    check("F-020 _store_mod_scan 保留 weight 字段", "weight" in _stored,
+          f"键={sorted(_stored)}")
+    check("F-020 _store_mod_scan 保留 category 字段", "category" in _stored)
+
+    _m._score_all()
+    _missing = [p["pid"] for p in _m.procs if "score" not in p or "level" not in p]
+    check("F-020 _score_all 后每个进程都带 score/level", not _missing, f"缺 {_missing}")
+    _b = [p for p in _m.procs if p["pid"] == _p2["pid"]][0]
+    check("F-020 深度扫描结论被并回进程评分", _b["level"] == "critical",
+          f"→ {_b['level']} / {_b['score']}")
+    _c = [p for p in _m.procs if p["pid"] == 3][0]
+    check("F-020 出问题的进程之后，其余进程仍被评分",
+          "score" in _c and "level" in _c, f"→ {_c.get('level')} / {_c.get('score')}")
+
+    # 4. 报告导出：state 里混入缺 score 的进程，也不得抛 KeyError / 印出 undefined
+    #    用真实 state 做底（保证 summary 等字段齐全），再塞进一条"缺 score"的进程。
+    _bad = mk("d.exe", r"C:\Windows\d.exe")
+    _bad["pid"] = 9
+    _bad["level"] = "high"          # 等级有、分数没有 —— 正是本次缺陷的形态
+    _bad.pop("score", None)
+    _st = _m.state()
+    _st["processes"] = [_bad, _p2]
+    try:
+        _html = _srv.build_report_html(_st)
+        check("F-020 报告导出对缺 score 的进程不抛异常",
+              "undefined" not in _html, f"报告 {len(_html)} 字符")
+    except Exception as _e:      # noqa: BLE001
+        _tb.print_exc()
+        check(f"F-020 报告导出对缺 score 的进程不抛异常（{type(_e).__name__}: {_e}）",
+              False)
+except Exception as _e:      # noqa: BLE001
+    check(f"F-020 评分链路行为测试（{type(_e).__name__}: {_e}）", False)
+
+
+print()
+print("=" * 72)
+print("F-021 白加黑 X003 —— 「尚未校验」不得被当作「可疑」")
+print("=" * 72)
+
+# 背景（2026-10-08 实测缺陷，本组用例把它固化）：
+#   verify_signatures 实测约 297 ms/文件；首次运行签名队列积压 647 个文件
+#   （≈3 分钟排空），而 _deep_scan_cycle 的"重试 4 次"只等于约 4 秒。
+#   计时器先到期 → treat_unknown_as_bad=True → 把 48 个**已正确签名**的同目录 DLL
+#   （Edge / 微信 / <workspace> / 网易 UU / Intel DSA）全部定罪成白加黑(critical 82)，
+#   并连带触发 N005 把它们的正常流量再报一遍 —— 界面上"一片爆红"。
+#   修复：未校验只排队；由签名线程在结果到达后放行复查（_deep_pending）。
+
+_edge_dir = r"C:\Program Files (x86)\Microsoft\Edge\Application"
+_edge_dll = _edge_dir + r"\154.0.4258.62\prefs_enclave_x64.dll"
+_edge = mk("msedge.exe", _edge_dir + r"\msedge.exe")
+_fake_detail = {"modules": [{"path": _edge_dll}]}
+_ctx_x = {"by_pid": {}, "sig_cache": {}, "artifacts": {}, "self_pid": 0, "own_children": {}}
+
+try:
+    import collector as _col   # noqa: E402
+    _orig_enrich = _col.enrich_process
+    _col.enrich_process = lambda _pid: _fake_detail      # 注入伪造的模块清单
+    try:
+        # ① 尚未校验 → 只能进 pending，绝不能定罪
+        _fs1, _pend1 = rules.deep_scan_process(_edge, _ctx_x)
+        check("F-021 模块未校验时不产生 X003",
+              not any(f["rule_id"] == "X003" for f in _fs1),
+              f"命中 {[f['rule_id'] for f in _fs1] or '无'}")
+        check("F-021 模块未校验时进入待校验队列", len(_pend1) == 1,
+              f"pending={_pend1}")
+
+        # ② 校验结果为「有效」→ 仍然不产生 X003（这正是 5 个正规软件被误判的场景）
+        _ctx_ok = dict(_ctx_x, sig_cache={_edge_dll.lower(): {"kind": "ok", "status_zh": "有效"}})
+        _fs2, _pend2 = rules.deep_scan_process(_edge, _ctx_ok)
+        check("F-021 模块校验为「有效」时不产生 X003",
+              not any(f["rule_id"] == "X003" for f in _fs2),
+              f"命中 {[f['rule_id'] for f in _fs2] or '无'}")
+        check("F-021 校验完成后不再重复排队", _pend2 == [], f"pending={_pend2}")
+
+        # ③ 校验结果确实不可信 → 这时才必须定罪（不能为了防误报把检出砍掉）
+        _ctx_bad = dict(_ctx_x, sig_cache={_edge_dll.lower(): {"kind": "unsigned", "status_zh": "未签名"}})
+        _fs3, _ = rules.deep_scan_process(_edge, _ctx_bad)
+        check("F-021 模块校验为「未签名」时必须产生 X003",
+              any(f["rule_id"] == "X003" for f in _fs3),
+              f"命中 {[f['rule_id'] for f in _fs3] or '无'}")
+
+        # ④ 严重度标定：普通「同目录未签名 DLL」只判中危。
+        #    实测依据：D:\Steam 24 个 DLL 有 23 个由 Valve/Nvidia/Microsoft 签名，
+        #    仅 libpyrowave-shared-0.dll 未签名；按旧的 high(82) 标定，steam.exe
+        #    一运行就被判 critical，再经 N005 把正常联机流量报成 9 条"疑似 C2 心跳"。
+        _x3 = next((f for f in _fs3 if f["rule_id"] == "X003"), None)
+        check("F-021 普通未签名同目录 DLL 只判中危（不再 high）",
+              _x3 is not None and _x3["severity"] == "medium" and _x3["weight"] == 45,
+              f"{_x3['severity']}/{_x3['weight']}" if _x3 else "未命中")
+
+        # ⑤ 反向验证：命中侧加载提示名单（经典劫持名）仍必须 critical ——
+        #    降级不能把真正的高精度信号一起砍掉。
+        _hint_dll = _edge_dir + r"\wjcapture.dll"
+        _col.enrich_process = lambda _pid: {"modules": [{"path": _hint_dll}]}
+        _ctx_hint = dict(_ctx_x, sig_cache={_hint_dll.lower(): {"kind": "unsigned", "status_zh": "未签名"}})
+        _fs4, _ = rules.deep_scan_process(_edge, _ctx_hint)
+        _x3h = next((f for f in _fs4 if f["rule_id"] == "X003"), None)
+        check("F-021 命中侧加载提示名单时仍判 critical(92)",
+              _x3h is not None and _x3h["severity"] == "critical" and _x3h["weight"] == 92,
+              f"{_x3h['severity']}/{_x3h['weight']}" if _x3h else "未命中")
+    finally:
+        _col.enrich_process = _orig_enrich
+except Exception as _e:      # noqa: BLE001
+    check(f"F-021 白加黑行为测试（{type(_e).__name__}: {_e}）", False)
+
+# ⑥ 网络侧与进程侧的弱信号门槛必须一致：netmon 只在 X003 判 critical 时才升级。
+#    这条断言的价值在于——它正是发现"进程侧判 high 而网络侧当弱信号"这一
+#    自相矛盾的依据；两边任何一侧被改动都会在这里暴露。
+_src_net = open(os.path.join(_common.app_dir(), "netmon.py"), encoding="utf-8").read()
+check("F-021 网络侧弱信号门槛与进程侧标定一致（mod_strong 只在 critical 时升级）",
+      'mod_sideload and mod_level == "critical"' in _src_net)
+
+# ④ 结构层面：必须有"签名结果到达后放行复查"的机制，否则又会退化成靠计时器猜
+check("F-021 存在「待校验复查」登记表（_deep_pending）", "_deep_pending" in src_srv)
+check("F-021 签名线程会放行待复查进程",
+      "self.deep_done.discard(_k)" in src_srv)
+check("F-021 复查轮即使结论为空也会写回 mod_scan（否则误报会永久粘住）",
+      "or self._deep_retry.get(key, 0) > 0" in src_srv)
+
+# ⑤ 自身进程不得被自己评分（2026-10-08 实测：监视器把自己的 pythonw.exe
+#    判成 P006「未签名程序运行于用户目录」，纯噪音且损害结果可信度）
+_self_proc = mk("pythonw.exe",
+                r"C:\Users\<用户名>\AppData\Local\Programs\<workspace>AI\resources\vendor\python\pythonw.exe",
+                sig_kind="unsigned")
+_self_proc["pid"] = 7777
+_ctx_self = {"by_pid": {}, "sig_cache": {}, "artifacts": {}, "self_pid": 7777, "own_children": {}}
+_ctx_other = dict(_ctx_self, self_pid=0)
+check("F-021 监视器不给自己打分（self_pid 被排除）",
+      rules.rules_process(_self_proc, _ctx_self) == [],
+      f"命中 {[f['rule_id'] for f in rules.rules_process(_self_proc, _ctx_self)]}")
+check("F-021 但同一个进程在 self_pid=0 时仍会被正常检出（排除范围没有放大）",
+      any(f["rule_id"] == "P006" for f in rules.rules_process(_self_proc, _ctx_other)),
+      f"命中 {[f['rule_id'] for f in rules.rules_process(_self_proc, _ctx_other)]}")
+
 
 print()
 print("=" * 72)

@@ -142,6 +142,34 @@ const LANGS = {
     wl_remove_body: '移除后，该条告警会重新出现。确定吗？',
     wl_remove_ok: '移除',
 
+    /* ---- 受监控文件 / 目录（2026-10-07 新增）---- */
+    watch_h: '受监控的文件 / 目录',
+    watch_sub: '把「文件被改动就告警」从"只管本程序"扩展到"你指定的任意路径"',
+    watch_none: '尚未添加监控目标。填入任意文件或目录路径，被修改 / 新增 / 删除都会进入告警时间线。',
+    watch_ph: '例如 D:\\重要资料   或   C:\\Windows\\System32\\drivers\\etc\\hosts',
+    watch_add: '添加监控',
+    watch_recursive: '含子目录',
+    watch_rebuild: '确认，重建监控基线',
+    watch_recheck: '立即全量复核',
+    watch_remove: '移除',
+    watch_col_path: '监控目标', watch_col_files: '文件数',
+    watch_col_diff: '变化', watch_col_act: '操作',
+    watch_diff: '改 {c} · 增 {a} · 删 {r}',
+    watch_st_missing: '路径不存在', watch_st_reparse: '联接 / 符号链接，已跳过',
+    watch_st_nobase: '尚未建立基线', watch_st_disabled: '已停用',
+    watch_files: '{n} 个文件',
+    watch_over_big: '其中 {n} 个超过 64 MB，未参与哈希比对',
+    watch_over_trunc: '超出单目标上限，已跳过 {n} 个文件',
+    watch_note: '它只报「变了」，不报「改成了什么」，也不阻断改动。默认每 60 秒比对一次，'
+              + '「改完又改回来」在两次比对之间不会被发现。'
+              + '若这次变化是你自己造成的，点「重建监控基线」即可消除；否则先导出报告留证。',
+    sec_log: '安全事件日志',
+    sec_log_note: '完整性异常、受监控文件变化、基线重建都会追加写入本地日志；'
+                + '重启后这些记录会被读回告警时间线，避免"重启把取证链剪断"。'
+                + '日志位于数据目录，**同权限攻击者可以删改它** —— 它的价值是防遗忘、便于转述，'
+                + '不是抗篡改审计存储。',
+    alert_from_log: '（重启前的记录）',
+
     sig_checking: '校验中', sig_ok: '签名有效', sig_forged: '签名伪造',
     sig_untrusted: '根证书不受信任', sig_noimage: '无镜像文件',
     sig_noimage_tip: '系统伪进程或 VBS 隔离组件，没有对应的可执行文件',
@@ -151,6 +179,7 @@ const LANGS = {
     conn_lost: '连接中断', count_items: '{a} / {b} 项',
     render_err: '界面渲染出错（按 F12 看控制台）',
     path_unreadable: '（无法读取路径）',
+    name_unreadable: '（进程名不可读）',
     chain_parent: '↑ 父进程',
     kv_pid: 'PID / PPID', kv_parent: '父进程', kv_user: '运行账户',
     kv_start: '启动时间', kv_cpu: 'CPU / 内存', kv_threads: '线程数 / 状态',
@@ -317,6 +346,35 @@ const LANGS = {
     wl_remove_body: '移除后，这条提醒会重新出现。确定吗？',
     wl_remove_ok: '移除',
 
+    /* ---- 我帮你盯着的文件（2026-10-07 新增）---- */
+    watch_h: '我帮你盯着的文件和文件夹',
+    watch_sub: '以前只管"程序自己有没有被改"，现在你指定的文件、文件夹也能一起盯',
+    watch_none: '还没添加。填一个文件或文件夹的路径，它被改了、多了、少了，都会出现在提醒里。',
+    watch_ph: '比如 D:\\重要资料   或   C:\\Windows\\System32\\drivers\\etc\\hosts',
+    watch_add: '开始盯着它',
+    watch_recursive: '里面的子文件夹也一起盯',
+    watch_rebuild: '这些改动是我自己弄的，重新记一遍',
+    watch_recheck: '现在全部重查一次',
+    watch_remove: '不盯了',
+    watch_col_path: '盯着什么', watch_col_files: '文件数',
+    watch_col_diff: '变化', watch_col_act: '操作',
+    watch_diff: '改了 {c} · 多了 {a} · 少了 {r}',
+    watch_st_missing: '这个路径找不到了', watch_st_reparse: '这是个链接，跳过了',
+    watch_st_nobase: '还没记过它长什么样', watch_st_disabled: '已停用',
+    watch_files: '{n} 个文件',
+    watch_over_big: '有 {n} 个文件太大（超过 64 MB），没算指纹',
+    watch_over_trunc: '文件太多，有 {n} 个没看',
+    watch_note: '它只知道「变了」，不知道「改成什么了」，也不会拦住改动。'
+              + '每 60 秒看一次，所以"改完马上改回去"是看不出来的。'
+              + '如果这次是你自己弄的，点「重新记一遍」就不报了；'
+              + '如果不是你弄的，先别急着重启，先把报告导出留个底。',
+    sec_log: '安全事件记录',
+    sec_log_note: '程序自己被改、你让我盯着的文件变了、重新记基线 —— 这些都会写进本地一份记录。'
+                + '重启之后这些记录会重新出现在提醒里，不会因为重启就全没了。'
+                + '记录文件就在数据目录里，跟你同样权限的程序能改它 —— '
+                + '它的用处是"帮你记住"，不是"防人删"。',
+    alert_from_log: '（重启前记下的）',
+
     sig_checking: '正在验签名', sig_ok: '签名正常', sig_forged: '签名是假的',
     sig_untrusted: '签名来路不明', sig_noimage: '没有可执行文件',
     sig_noimage_tip: '系统自带的特殊进程，本身就没有对应的程序文件',
@@ -326,6 +384,7 @@ const LANGS = {
     conn_lost: '连接中断', count_items: '{a} / {b} 个',
     render_err: '界面显示出错了（按 F12 看控制台）',
     path_unreadable: '（读不到文件位置）',
+    name_unreadable: '（读不到进程名）',
     chain_parent: '↑ 启动它的',
     kv_pid: 'PID / PPID', kv_parent: '是谁启动的', kv_user: '以谁的身份运行',
     kv_start: '什么时候启动的', kv_cpu: 'CPU / 内存', kv_threads: '线程数 / 状态',
@@ -500,7 +559,8 @@ let openArt = new Set();
 
 /* 会话令牌：由服务端注入到 <meta>，POST 必须携带。
    作用是把跨域伪造请求挡在门外（自定义头会强制浏览器预检，跨域预检必然失败）。 */
-const TOKEN = (document.querySelector('meta[name="yinhu-token"]') || {}).content || '';
+function _cookieVal(name){try{const m=document.cookie.match(new RegExp('(?:^|; )'+name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'=([^;]*)'));return m?decodeURIComponent(m[1]):'';}catch(e){return '';}}
+const TOKEN = _cookieVal('yinhu-token');
 
 /** 统一的 POST 封装 —— 所有写操作都必须走这里，确保带上令牌与正确的 Content-Type */
 async function api(path, payload) {
@@ -647,8 +707,11 @@ function render() {
       <b>${esc(v)}</b><span>${esc(label)}</span><i>${esc(sub)}</i>
     </div>`).join('');
 
-  /* Tab 计数 */
-  const risky = STATE.processes.filter((p) => LEVEL_ORDER[p.level] >= 3).length;
+  /* Tab 计数。
+     ⚠️ 用 (LEVEL_ORDER[p.level] || 0)：后端一旦没下发 level，`undefined >= 3`
+     会静默为 false，计数恒为 0 —— 2026-10-08 实测过这个症状（表现为"明明有
+     异常进程，标签页却显示 0"）。宁可退化成 0 也要让表达式有确定的语义。 */
+  const risky = STATE.processes.filter((p) => (LEVEL_ORDER[p.level] || 0) >= 3).length;
   $('#tabProcCount').textContent = risky;
   $('#tabProcCount').className = L.critical > 0 ? 'crit' : (L.high > 0 ? 'high' : '');
   $('#tabArtCount').textContent = s.artifact_findings;
@@ -668,6 +731,7 @@ function render() {
   renderArtifacts();
   renderAlerts();
   renderSecurity();
+  renderWatch();
   if (!RULES_LOADED) loadRules();
 }
 
@@ -709,15 +773,22 @@ function renderProcTable() {
 
   const rows = list.map((p) => {
     const sv = sigView(p);
+    // 风险等级 / 分数 / 进程名一律兜底，绝不把 undefined 印到页面上。
+    // 2026-10-08 实测：后端评分链路抛异常后，156 个进程的 level/score 缺失，
+    // 界面直接渲染出 class="undefined"、徽章文字 "undefined"。
+    // 界面是最后一道防线 —— 数据不完整时必须退化成"正常"，而不是把
+    // 内部状态泄漏给用户（用户看到 undefined 只会认为工具坏了，且无法判断真假）。
+    const lv = LEVEL_ORDER[p.level] != null ? p.level : 'clean';
+    const score = (p.score == null ? 0 : p.score);
     const hits = (p.findings || []).slice(0, 3).map((f) =>
       `<span class="hit ${f.severity}" title="${esc(f.evidence)}">${esc(ruleTitle(f))}</span>`).join('');
     const more = (p.findings || []).length > 3
       ? `<span class="hit">+${p.findings.length - 3}</span>` : '';
     const nc = (p.connections || []).length;
-    return `<tr class="${p.level}" data-pid="${p.pid}">
-      <td><span class="badge ${p.level}">${LEVEL_ZH[p.level]}</span>
-          <span class="score ${p.level}">${p.score}</span></td>
-      <td><span class="cname">${esc(p.name)}<small>${esc(p.username || '')}</small></span></td>
+    return `<tr class="${lv}" data-pid="${p.pid}">
+      <td><span class="badge ${lv}">${esc(LEVEL_ZH[lv] || lv)}</span>
+          <span class="score ${lv}">${esc(String(score))}</span></td>
+      <td><span class="cname">${esc(p.name || T('name_unreadable'))}<small>${esc(p.username || '')}</small></span></td>
       <td class="mono">${p.pid}</td>
       <td><div class="pth" title="${esc(p.exe)}">${esc(p.exe || T('path_unreadable'))}</div></td>
       <td><span class="sig ${sv.cls}">${sv.mark} ${esc(sv.txt)}${sv.cn ? `<small title="${esc(sv.cn)}">${esc(sv.cn)}</small>` : ''}</span></td>
@@ -876,7 +947,7 @@ function renderNet() {
 }
 
 function renderNetControl(net) {
-  const stops = net.duration_stops || [30, 60, 120, 180, 300, 600, 900];
+  const stops = net.duration_stops || [30, 60, 120, 180, 300, 600, 900, 1800];
   const sl = $('#netSlider');
   const ses = net.session || {};
 
@@ -925,6 +996,33 @@ function renderNetControl(net) {
 
   $('#netStart').disabled = false;
   $('#netStop').disabled = ses.phase !== 'collecting';
+}
+
+function netProcProvenance(f) {
+  const parts = [];
+  if (f.parent_name) parts.push(`父 ${esc(f.parent_name)}`);
+  if (f.proc_dir) parts.push(`目录 ${esc(f.proc_dir)}`);
+  if (f.proc_user) parts.push(`账户 ${esc(f.proc_user)}`);
+  if (!parts.length) return '';
+  return `<small class="prov">${parts.join(' · ')}</small>`;
+}
+
+function netModSection(d) {
+  if (!(d.mod_ioc || d.mod_disguised || d.mod_sideload)) return '';
+  const cls = d.mod_level === 'critical' ? 'crit' : 'high';
+  const title = d.mod_summary || '检测到可疑模块加载';
+  const detail = (d.proc_mod_findings || []).map((f) => `
+    <div class="dfind ${f.severity}">
+      <div class="ft"><span class="badge ${f.severity}">${f.severity_zh || f.severity}</span>
+        [${esc(f.rule_id)}] ${esc(f.title)}</div>
+      <div class="ev">${esc(f.evidence || '')}</div>
+      ${f.advice ? `<div class="ad">${esc(f.advice)}</div>` : ''}
+    </div>`).join('') || '<div style="color:var(--ok);font-size:12.5px">无详情</div>';
+  return `<div class="dsec bjh">
+      <h4>白加黑 / 模块侧加载检测 <span class="badge ${cls}">${esc(title)}</span></h4>
+      ${detail}
+      <div class="kvline dim">提示：仅凭进程名 / 签名无法识破「白加黑」。请核对父进程、路径与所加载模块是否异常。</div>
+    </div>`;
 }
 
 function renderNetTable(net) {
@@ -979,16 +1077,20 @@ function renderNetTable(net) {
     if (f.port_class === 'silverfox') tags.push(`<span class="tag bad">${esc(T('tag_sf_port'))}</span>`);
     if (f.proc_untrusted) tags.push(`<span class="tag warn">${esc(T('tag_unsigned'))}</span>`);
     if (f.resolution_limited) tags.push(`<span class="tag dim">${esc(T('tag_reslim'))}</span>`);
+    if (f.mod_ioc || f.mod_disguised || f.mod_sideload) {
+      tags.push(`<span class="tag ${f.mod_level === 'critical' ? 'bad' : 'warn'}">白加黑</span>`);
+    }
 
     const sub = [];
     if (f.regularity_source) sub.push(esc(regSource(f.regularity_source)));
     if (f.avg_interval != null) sub.push(esc(Tn('sub_period', { v: fmtPeriod(f.avg_interval) })));
     if (f.jitter_pct != null) sub.push(esc(Tn('sub_jitter', { v: f.jitter_pct })));
 
-    return `<tr class="${f.level} netrow${f.regularity != null && f.regularity >= 85 ? ' reg-hi' : ''}"
+    const flv = LEVEL_ORDER[f.level] != null ? f.level : 'clean';
+    return `<tr class="${flv} netrow${f.regularity != null && f.regularity >= 85 ? ' reg-hi' : ''}"
         data-nkey="${esc(f.key)}">
-      <td><span class="badge ${f.level}">${LEVEL_ZH[f.level]}</span>
-          <span class="score ${f.level}">${Math.round(f.score)}</span></td>
+      <td><span class="badge ${flv}">${esc(LEVEL_ZH[flv] || flv)}</span>
+          <span class="score ${flv}">${esc(String(Math.round(f.score || 0)))}</span></td>
       <td>
         <div class="regcell ${rc}">
           <div class="regbar"><i style="width:${f.regularity == null ? 0 : f.regularity}%"></i></div>
@@ -996,7 +1098,7 @@ function renderNetTable(net) {
         </div>
         <div class="regsub">${sub.join(' · ') || (f.note ? esc(f.note) : esc(T('reg_noeval')))}</div>
       </td>
-      <td><span class="cname">${esc(f.name)}<small>PID ${f.pid} · ${esc(f.signature_zh)}</small></span></td>
+      <td><span class="cname">${esc(f.name)}<small>PID ${f.pid} · ${esc(f.signature_zh)}</small></span>${netProcProvenance(f)}</td>
       <td>
         <div class="remote mono">${esc(f.rip)}:${f.rport}</div>
         <div class="rsub">${tags.join('')}</div>
@@ -1112,7 +1214,7 @@ function renderNetDetail(d) {
           <div class="nvnum">${regText(d.regularity)}<small>规律性</small></div>
         </div>
         <div class="nvtext">
-          <b>${esc(LEVEL_ZH[d.level])} · ${esc(d.verdict)}</b>
+          <b>${esc(LEVEL_ZH[d.level] || LEVEL_ZH.clean)} · ${esc(d.verdict)}</b>
           <div class="kvline">${d.regularity_source ? '证据来源：' + esc(d.regularity_source) : '无可评估的时序证据'}
             ${d.avg_interval != null ? ' · 平均周期 ' + esc(fmtPeriod(d.avg_interval)) : ''}
             ${d.jitter_pct != null ? ' · 抖动 ' + esc(String(d.jitter_pct)) + '%' : ''}</div>
@@ -1148,9 +1250,16 @@ function renderNetDetail(d) {
         <dt>数字签名</dt><dd>${esc(d.signature_zh)}</dd>
         <dt>进程风险</dt><dd>${esc(LEVEL_ZH[d.proc_level] || d.proc_level)} · ${Math.round(d.proc_score)} 分
           ${d.proc_untrusted ? '<span style="color:var(--high)">（签名不可信）</span>' : ''}</dd>
+        <dt>父进程</dt><dd>${esc(d.parent_name || '—')}${d.ppid ? ` <span class="dim">(PID ${d.ppid})</span>` : ''}</dd>
+        <dt>进程目录</dt><dd class="mono">${esc(d.proc_dir || '—')}</dd>
+        <dt>运行账户</dt><dd>${esc(d.proc_user || '—')}</dd>
+        <dt>启动时间</dt><dd>${d.proc_ctime ? esc(new Date(d.proc_ctime * 1000).toLocaleString()) : '—'}</dd>
+        <dt>命令行</dt><dd class="mono cmd">${esc(d.proc_cmdline || '—')}</dd>
         <dt>UDP 端口</dt><dd class="mono">${(d.udp_ports || []).join('、') || '—'}</dd>
       </dl>
     </div>
+
+    ${netModSection(d)}
 
     <div class="dsec">
       <h4>观测统计</h4>
@@ -1185,11 +1294,12 @@ function renderArtifacts() {
         <div class="ev">${esc(f.evidence)}</div>
         ${f.advice ? `<div class="ad">${esc(f.advice)}</div>` : ''}
       </div>`).join('');
-    return `<div class="artcard ${a.level}${open}" data-aid="${esc(a.id)}">
+    const alv = LEVEL_ORDER[a.level] != null ? a.level : 'clean';
+    return `<div class="artcard ${alv}${open}" data-aid="${esc(a.id)}">
       <div class="arthead">
         <span class="artkind">${esc(KIND_ZH[a.kind] || a.kind)}</span>
         <h3>${esc(a.title)}</h3>
-        <span class="badge ${a.level}">${LEVEL_ZH[a.level]} · ${a.score}</span>
+        <span class="badge ${alv}">${esc(LEVEL_ZH[alv] || alv)} · ${esc(String(a.score == null ? 0 : a.score))}</span>
       </div>
       <div class="artsub">${esc(a.subtitle || '')}</div>
       <div class="artbody">${fs}</div>
@@ -1207,14 +1317,16 @@ function renderAlerts() {
       <div class="alarm-rule">[${esc(r.id)}] ${esc(ruleTitle({ rule_id: r.id, title: r.title }))}
         <div class="ev">${esc(r.evidence)}</div>
         ${r.advice ? `<div class="alarm-adv">${esc(r.advice)}</div>` : ''}</div>`).join('');
-    return `<div class="alertitem ${a.level}${a.net ? ' netalert' : ''}"
+    return `<div class="alertitem ${a.level}${a.net ? ' netalert' : ''}${a.watch ? ' watchalert' : ''}"
         ${a.net_key ? `data-nkey="${esc(a.net_key)}"` : ''}>
       <div class="alarm-head">
         <time>${esc(a.time)}</time>
-        <span class="badge ${a.level}">${LEVEL_ZH[a.level]}</span>
+        <span class="badge ${LEVEL_ORDER[a.level] != null ? a.level : 'clean'}">${esc(LEVEL_ZH[a.level] || LEVEL_ZH.clean)}</span>
         <b>${esc(a.name)}</b>
         ${a.pid ? `<span class="mono" style="color:var(--dim)">PID ${a.pid}</span>` : ''}
         ${a.net ? '<span class="nettag">网络</span>' : ''}
+        ${a.watch ? `<span class="nettag">文件监控</span>` : ''}
+        ${a.from_log ? `<span class="logtag">${esc(T('alert_from_log'))}</span>` : ''}
       </div>
       ${a.exe ? `<div class="artsub">${esc(a.exe)}</div>` : ''}
       <div class="alarm-rules">${rules}</div>
@@ -1327,6 +1439,141 @@ function renderSecurity() {
       toast(r.msg, r.ok ? 'ok' : 'err');
       poll();
     });
+  }
+}
+
+/* ---------------------------- 受监控的文件 / 目录（2026-10-07 新增）
+   数据来自 /api/state 的 STATE.watch（配置）与 STATE.watch_state（上一次比对结果）。
+
+   ⚠️ 两个已经踩过的坑，这里必须避开：
+     1. **不能逐个绑监听。** renderSecurity 那一块踩过（红队 F-010）：
+        每次渲染都用 innerHTML 换掉整片节点，监听器随旧节点一起被丢弃，
+        按钮点了没反应、且不报任何错。这里统一事件委托到 #watchBox 上，
+        而 #watchBox 这个元素本身在整个会话里不会被替换。
+     2. **数据必须随 /api/state 一起下发。** poll() 是整体替换 STATE，
+        任何"单独 fetch 后挂在 STATE 上"的字段都会被下一轮冲掉（实测踩过）。 */
+function renderWatch() {
+  const box = $('#watchBox');
+  if (!box) return;
+  const cfg = STATE.watch || {};
+  const st = STATE.watch_state || {};
+  const targets = cfg.targets || [];
+  const byId = {};
+  (st.targets || []).forEach((r) => { byId[r.id] = r; });
+  const log = STATE.auditlog || {};
+  const s = STATE.summary || {};
+
+  const cntEl = $('#watchCount');
+  if (cntEl) cntEl.textContent = targets.length ? `${targets.length} 个目标` : '';
+
+  const statusOf = (r) => {
+    if (!r) return '';
+    if (r.status === 'missing') return T('watch_st_missing');
+    if (r.status === 'reparse') return T('watch_st_reparse');
+    if (r.status === 'disabled') return T('watch_st_disabled');
+    if (r.note) return T('watch_st_nobase');
+    return '';
+  };
+
+  const rows = targets.map((t) => {
+    const r = byId[t.id] || {};
+    const notes = [];
+    const sm = statusOf(r);
+    if (sm) notes.push(sm);
+    if (r.too_big) notes.push(Tn('watch_over_big', { n: r.too_big }));
+    if (r.truncated) notes.push(Tn('watch_over_trunc', { n: r.truncated }));
+    const bad = (r.changed || 0) + (r.added || 0) + (r.removed || 0);
+    const diff = bad
+      ? `<b class="wbad">${esc(Tn('watch_diff', { c: r.changed || 0, a: r.added || 0,
+                                                   r: r.removed || 0 }))}</b>`
+      : '<span class="wok">—</span>';
+    return `<tr>
+      <td><div class="wlabel">${esc(t.label || '')}</div>
+        <div class="wpathline" title="${esc(t.path || '')}">${esc(t.path || '')}</div>
+        ${notes.length ? `<div class="wstatus">${notes.map(esc).join(' · ')}</div>` : ''}</td>
+      <td class="wnum">${esc(Tn('watch_files', { n: r.files || 0 }))}</td>
+      <td class="wnum">${diff}</td>
+      <td class="wact"><button class="btn mini" data-wrm="${esc(t.id)}">${
+        esc(T('watch_remove'))}</button></td>
+    </tr>`;
+  }).join('');
+
+  box.innerHTML = `
+    <div class="wcard">
+      <div class="wsub">${esc(T('watch_sub'))}</div>
+      <div class="wadd">
+        <input type="text" id="wPath" placeholder="${esc(T('watch_ph'))}"
+               autocomplete="off" spellcheck="false">
+        <label class="wchk"><input type="checkbox" id="wRec" checked>
+          ${esc(T('watch_recursive'))}</label>
+        <button class="btn primary" id="btnWatchAdd">${esc(T('watch_add'))}</button>
+      </div>
+      ${cfg.corrupt ? `<div class="warnbox">监控配置文件已损坏，已拒绝写入 ——
+        这样至少不会用一张空表覆盖掉你原有的监控目标。</div>` : ''}
+      ${targets.length ? `<table class="wtable">
+        <thead><tr>
+          <th>${esc(T('watch_col_path'))}</th>
+          <th class="wnum">${esc(T('watch_col_files'))}</th>
+          <th class="wnum">${esc(T('watch_col_diff'))}</th>
+          <th class="wact">${esc(T('watch_col_act'))}</th>
+        </tr></thead><tbody>${rows}</tbody></table>`
+        : `<div class="wnone">${esc(T('watch_none'))}</div>`}
+      <div class="wacts">
+        <button class="btn" id="btnWatchAccept">${esc(T('watch_rebuild'))}</button>
+        <button class="btn" id="btnWatchCheck">${esc(T('watch_recheck'))}</button>
+      </div>
+      <div class="wlog"><b>${esc(T('sec_log'))}</b>：
+        <code>${esc(log.path || '')}</code>
+        ${log.exists ? `· ${(log.bytes / 1024).toFixed(1)} KB` : '（尚未产生）'}
+        ${s.alerts_from_log ? `· 本次已从日志还原 ${s.alerts_from_log} 条历史记录` : ''}
+      </div>
+      <div class="wnote">${T('watch_note')}</div>
+      <div class="wnote">${T('sec_log_note')}</div>
+    </div>`;
+}
+
+async function onWatchClick(ev) {
+  const rm = ev.target.closest('[data-wrm]');
+  if (rm) {
+    const ok = await confirmBox({
+      title: T('watch_remove'),
+      body: '移除后不再监控该路径，它的基线记录也会一并删除。之后它再被改动就不会告警了。',
+      okText: T('watch_remove'),
+    });
+    if (!ok) return;
+    const r = await api('/api/watch/remove', { id: rm.dataset.wrm });
+    toast(r.msg, r.ok ? 'ok' : 'err');
+    poll();
+    return;
+  }
+  if (ev.target.id === 'btnWatchAdd') {
+    const el = $('#wPath');
+    const p = (el && el.value ? el.value : '').trim();
+    if (!p) { toast('请先填写要监控的路径', 'err'); return; }
+    const rec = $('#wRec') ? $('#wRec').checked : true;
+    const r = await api('/api/watch/add', { path: p, recursive: rec });
+    toast(r.msg, r.ok ? 'ok' : 'err');
+    if (r.ok && el) el.value = '';
+    poll();
+    return;
+  }
+  if (ev.target.id === 'btnWatchAccept') {
+    const ok = await confirmBox({
+      title: T('watch_rebuild'),
+      body: '会把当前状态整体记为「已知正常」，此后新的改动才会再次告警。'
+          + '如果你并不确定这些改动是谁做的，请先点「导出报告」留证。',
+      okText: '确认', danger: false,
+    });
+    if (!ok) return;
+    const r = await api('/api/watch/accept');
+    toast(r.msg, r.ok ? 'ok' : 'err');
+    poll();
+    return;
+  }
+  if (ev.target.id === 'btnWatchCheck') {
+    const r = await api('/api/watch/check');
+    toast(r.msg, r.ok ? 'ok' : 'err');
+    return;
   }
 }
 
@@ -1454,7 +1701,8 @@ async function openDetail(pid) {
         <dt>${esc(T('kv_parent'))}</dt><dd>${esc(p.parent_name || '—')}</dd>
         <dt>${esc(T('kv_user'))}</dt><dd>${esc(p.username || '—')}</dd>
         <dt>${esc(T('kv_start'))}</dt><dd>${esc(startT)}</dd>
-        <dt>${esc(T('kv_cpu'))}</dt><dd>${p.cpu}% / ${p.rss_mb} MB</dd>
+        <dt>${esc(T('kv_cpu'))}</dt><dd>${dt.error ? '—'
+          : `${dt.cpu || 0}% / ${dt.rss_mb || 0} MB`}</dd>
         <dt>${esc(T('kv_threads'))}</dt><dd>${dt.threads || '—'} / ${esc(dt.status || '—')}</dd>
       </dl>
     </div>
@@ -1576,6 +1824,12 @@ document.addEventListener('DOMContentLoaded', () => {
     await refreshWhitelist();
   });
 
+  // 「受监控文件 / 目录」面板同理：卡片内容是每次 renderWatch() 重新生成的，
+  // 逐个绑监听会被 innerHTML 一起丢掉（红队 F-010 的同一个坑，别再踩一次）。
+  // 委托目标 #watchBox 本身在整个会话里不被替换。
+  const wb = $('#watchBox');
+  if (wb) wb.addEventListener('click', onWatchClick);
+
   $$('.tab').forEach((t) => t.addEventListener('click', () => {
     $$('.tab').forEach((x) => x.classList.remove('active'));
     $$('.tabpane').forEach((x) => x.classList.remove('active'));
@@ -1607,7 +1861,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // 就打一次接口，既浪费又会让会话被反复重开。
   $('#netSlider').addEventListener('input', (e) => {
     NET.touched = true;
-    const stops = (STATE.net && STATE.net.duration_stops) || [30, 60, 120, 180, 300, 600, 900];
+    const stops = (STATE.net && STATE.net.duration_stops) || [30, 60, 120, 180, 300, 600, 900, 1800];
     const i = Number(e.target.value) || 0;
     const d = stops[i] || 120;
     $('#netDurVal').textContent = durLabel(d);
@@ -1624,7 +1878,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   $('#netStart').addEventListener('click', async () => {
-    const stops = (STATE.net && STATE.net.duration_stops) || [30, 60, 120, 180, 300, 600, 900];
+    const stops = (STATE.net && STATE.net.duration_stops) || [30, 60, 120, 180, 300, 600, 900, 1800];
     const d = stops[Number($('#netSlider').value)] || 120;
     const r = await api('/api/net/start', { duration: d });
     toast(r.msg || '已开始', r.ok ? 'ok' : 'err');
@@ -1803,6 +2057,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Escape') { closeDetail(); closeModal(false); }
   });
 
-  poll();
-  setInterval(poll, 2000);
+  /* 轮询节奏 —— 2026-10-07 由 2 秒提到 1 秒（用户反馈"界面反应慢"）。
+     用「自调度」而不是 setInterval：/api/state 单次约 450 KB，
+     一旦某轮请求耗时超过间隔，setInterval 会让请求不断堆积、越滚越慢
+     （表现为界面越用越卡，而服务端看起来一切正常）。
+     自调度的语义是"上一轮结束之后再等 N 毫秒" —— 永远不会重叠。 */
+  const POLL_MS = 1000;
+  (function pollLoop() {
+    poll().then(() => setTimeout(pollLoop, POLL_MS),
+                () => setTimeout(pollLoop, POLL_MS));
+  })();
 });

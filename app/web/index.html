@@ -3,7 +3,6 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="yinhu-token" content="__YINHU_TOKEN__">
 <title>银狐进程监视器 · SilverFox Sentinel</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -93,7 +92,7 @@
           <span class="netctl-hint" id="netDurHint"></span>
         </div>
         <div class="slider-wrap">
-          <input type="range" id="netSlider" min="0" max="6" step="1" value="2"
+          <input type="range" id="netSlider" min="0" max="7" step="1" value="2"
                  aria-label="观测时长" autocomplete="off">
           <div class="slider-ticks" id="netTicks"></div>
         </div>
@@ -182,6 +181,13 @@
     <div class="arthint" id="rulesHint"></div>
     <h2 class="sec"><span data-t="sec_status">安全状态</span> <span id="secChecked"></span></h2>
     <div class="secgrid" id="secBox"></div>
+
+    <!-- 受监控的文件 / 目录（2026-10-07 新增）：把"文件被改动就告警"从
+         「只管本程序」扩展到「用户指定的任意路径」。 -->
+    <h2 class="sec" style="margin-top:22px">
+      <span data-t="watch_h">受监控的文件 / 目录</span> <span id="watchCount"></span>
+    </h2>
+    <div class="watchbox" id="watchBox"></div>
 
     <div class="two-col" style="margin-top:20px">
       <div>

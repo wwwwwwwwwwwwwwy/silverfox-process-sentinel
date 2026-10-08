@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 # 程序代码目录（本文件所在目录）
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,18 +26,43 @@ PROGRAM_DIR = os.path.dirname(APP_DIR)
 
 _DATA_SUBDIR = "SilverFoxSentinel"
 
+# 可写性探测的缓存。
+#
+# ⚠️ 为什么必须缓存（2026-10-07 实测）：`_writable()` 的做法是
+#    「建文件 → 写入 → 删掉」，这是一次**真实的磁盘写操作**，
+#    本机单次耗时约 **450 ms** —— 文件创建与删除会被杀软的实时防护各拦一道。
+#
+#    而 `describe()` 会被 `/api/state` 每次轮询调用一次。
+#    于是界面每秒凭空卡 450 ms，表现为"点了没反应 / 数据半天不刷新"，
+#    看起来像是扫描慢，实际是这一行探测。**这是本次"扫描速度太慢"的第二个真凶**，
+#    而且它跟扫描间隔完全无关 —— 把间隔从 3 秒改成 1 秒也不会好一点。
+#
+#    目录可写性几乎不会变（除非用户去改 ACL），缓存 60 秒足够。
+_WRITABLE_CACHE: dict[str, tuple[float, bool]] = {}
+_WRITABLE_TTL = 60.0
 
-def _writable(d: str) -> bool:
-    """目录是否存在且真的能写（仅 makedirs 成功不代表能写文件）。"""
+
+def _writable(d: str, use_cache: bool = False) -> bool:
+    """目录是否存在且真的能写（仅 makedirs 成功不代表能写文件）。
+
+    use_cache=True 时结果缓存 60 秒 —— 给会被高频调用的 describe() 用。
+    """
+    if use_cache:
+        hit = _WRITABLE_CACHE.get(d)
+        if hit and (time.monotonic() - hit[0]) < _WRITABLE_TTL:
+            return hit[1]
     try:
         os.makedirs(d, exist_ok=True)
         probe = os.path.join(d, ".write_probe")
         with open(probe, "w", encoding="ascii") as f:
             f.write("1")
         os.remove(probe)
-        return True
+        ok = True
     except Exception:
-        return False
+        ok = False
+    if use_cache:
+        _WRITABLE_CACHE[d] = (time.monotonic(), ok)
+    return ok
 
 
 def data_dir() -> str:
@@ -86,11 +112,15 @@ def ensure_dirs() -> None:
 
 
 def describe() -> dict:
-    """给界面/日志用：当前实际使用的目录。"""
+    """给界面/日志用：当前实际使用的目录。
+
+    ⚠️ 这里的 _writable 必须走缓存：本函数被 /api/state 每次轮询调用，
+    直接探测会在磁盘上做一次「建-写-删」，本机实测 450 ms/次（见 _writable 注释）。
+    """
     return {
         "app_dir": APP_DIR,
         "program_dir": PROGRAM_DIR,
         "data_dir": DATA_DIR,
-        "writable": _writable(DATA_DIR),
+        "writable": _writable(DATA_DIR, use_cache=True),
         "on_program_dir": os.path.abspath(DATA_DIR) == os.path.abspath(PROGRAM_DIR),
     }
