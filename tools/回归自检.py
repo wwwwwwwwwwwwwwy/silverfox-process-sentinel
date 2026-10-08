@@ -1680,6 +1680,105 @@ check("F-021 但同一个进程在 self_pid=0 时仍会被正常检出（排除�
       f"命中 {[f['rule_id'] for f in rules.rules_process(_self_proc, _ctx_other)]}")
 
 
+# ============================================================================
+print()
+print("=" * 72)
+print("F-022 完整性假告警 + 「已恢复」标注 —— 历史条目不得冒充当前问题")
+print("=" * 72)
+import integrity as _it22   # noqa: E402
+import server as _srv22     # noqa: E402
+import tempfile as _tf22    # noqa: E402
+import json as _json22      # noqa: E402
+
+# ⚠️ 从模块自身推导 app 目录 —— 不要写 HERE/app，
+#    否则仓库副本（自检在 tools/ 下）会找错路径。
+_app22 = os.path.dirname(os.path.abspath(_it22.__file__))
+_s22 = io.open(os.path.join(_app22, "server.py"), encoding="utf-8").read()
+_j22 = io.open(os.path.join(_app22, "web", "app.js"), encoding="utf-8").read()
+
+# ---- 源码层
+check("F-022 integrity 有键名格式判定函数",
+      "def _baseline_keys_compatible" in _itg)
+check("F-022 load_baseline 的回退候选要过格式校验",
+      "not is_primary and not _baseline_keys_compatible" in _itg)
+check("F-022 历史条目带来源类别 log_kind",
+      '\"log_kind\": r.get(\"kind\")' in _s22)
+check("F-022 输出走 _alerts_for_ui（历史条目可标已恢复）",
+      "self._alerts_for_ui()[:100]" in _s22)
+check("F-022 「发现的问题」徽章排除已恢复条目", "!a.resolved" in _j22)
+check("F-022 已恢复标签两套语言都有", _j22.count("alert_resolved:") == 2)
+
+# ---- 行为层：键名格式判定（自包含，不依赖机器上是否存在某些文件）
+_legacy22 = {"rules.py": "a", "python_path.txt": "b", "whitelist.json": "c",
+             "停止监视器.bat": "d"}
+_cur22 = {"rules.py": "a", "<root>/python_path.txt": "b",
+          "<root>/whitelist.json": "c", "<root>/停止监视器.bat": "d",
+          "web/app.js": "e"}
+check("F-022 旧格式基线判为不兼容",
+      _it22._baseline_keys_compatible(_legacy22) is False)
+check("F-022 新格式基线判为兼容",
+      _it22._baseline_keys_compatible(_cur22) is True)
+check("F-022 空基线不误伤", _it22._baseline_keys_compatible({}) is True)
+
+# ---- 行为层：旧格式回退必须被拒绝，且不得报成 changed
+_td22 = _tf22.mkdtemp(prefix="sfx_f022_")
+_fa22 = os.path.join(_td22, "app")
+os.makedirs(_fa22, exist_ok=True)
+with io.open(os.path.join(_td22, "integrity.baseline.json"), "w",
+             encoding="utf-8") as f:
+    _json22.dump({"app_dir": _fa22, "created": "2026-10-06 09:59:05",
+                  "files": _legacy22}, f, ensure_ascii=False)
+check("F-022 只有旧格式基线时 load_baseline 返回 None",
+      _it22.load_baseline(_td22, _fa22) is None)
+
+_curman22 = _it22.collect_manifest(_app22, _it22.default_extras())
+_incompat22 = {}
+for _k, _v in _curman22.items():
+    _incompat22[_k[7:] if _k.startswith("<root>/") else _k] = "0" * 8
+with io.open(os.path.join(_td22, "integrity.baseline.json"), "w",
+             encoding="utf-8") as f:
+    _json22.dump({"app_dir": _app22, "created": "2026-10-06 09:59:05",
+                  "files": _incompat22}, f, ensure_ascii=False)
+_it22.save_sentinel(_td22, _curman22, _app22)
+_r22 = _it22.verify(_app22, _td22, _it22.default_extras())
+check("F-022 旧格式基线不得报成 changed（假告警）",
+      _r22.get("status") != "changed", f"status={_r22.get('status')}")
+check("F-022 且 added/removed 为空（不再'每个文件既新增又缺失'）",
+      not _r22.get("added") and not _r22.get("removed"),
+      f"added={len(_r22.get('added') or [])} removed={len(_r22.get('removed') or [])}")
+
+
+class _LK22:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_m22 = _srv22.Monitor.__new__(_srv22.Monitor)   # 不走 __init__，只测这个方法
+_m22.lock = _LK22()
+_m22.alerts = [
+    {"level": "critical", "from_log": True, "log_kind": "integrity",
+     "name": "程序文件完整性异常"},
+    {"level": "critical", "name": "当前发现的问题"},
+    {"level": "medium", "from_log": True, "log_kind": "watch",
+     "name": "受监控文件被改动"},
+]
+_m22.integrity = {"status": "ok"}
+_o22 = _m22._alerts_for_ui()
+check("F-022 当前完整性 ok → 历史 integrity 条目标为已恢复",
+      _o22[0].get("resolved") is True)
+check("F-022 非历史条目不受影响", "resolved" not in _o22[1])
+check("F-022 历史 watch 条目不受影响（由 check_watch 独立重检）",
+      "resolved" not in _o22[2])
+check("F-022 不就地改写内部列表（不污染内部状态）",
+      "resolved" not in _m22.alerts[0])
+_m22.integrity = {"status": "changed"}
+check("F-022 当前完整性 changed → **不**标已恢复（不掩盖仍然存在的问题）",
+      "resolved" not in _m22._alerts_for_ui()[0])
+
+
 print()
 print("=" * 72)
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")

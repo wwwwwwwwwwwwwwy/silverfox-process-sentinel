@@ -614,3 +614,14 @@ table.netgrid tbody tr.reg-hi.high{box-shadow:inset 3px 0 0 0 var(--high)}
 .dsec.bjh .badge.crit{background:var(--crit);color:#fff}
 .dsec.bjh .badge.high{background:var(--high);color:#1b1b1b}
 dd.cmd{white-space:pre-wrap;word-break:break-all;max-height:120px;overflow:auto}
+
+/* ---------- 告警时间线：已恢复的历史条目 ---------- */
+/* 为什么需要：历史安全事件会从安全日志还原进时间线，并保留原始等级。
+   若它描述的问题**现在已经不存在**（例如程序文件是被用户自己更新过、
+   并已重建基线），仍按 critical 画出来就会与顶栏「目前没问题」、
+   KPI「0 严重」自相矛盾 —— 而常态化误报会让用户学会无视告警，
+   等于把整个自检废掉（2026-10-08 实测挂了一整天）。 */
+.alertitem.resolved{opacity:.62}
+.alertitem.resolved .alarm-head b{font-weight:500}
+.logtag.resolved{background:rgba(63,185,80,.14);color:var(--ok);
+  border:1px solid rgba(63,185,80,.3)}

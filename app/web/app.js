@@ -169,6 +169,7 @@ const LANGS = {
                 + '日志位于数据目录，**同权限攻击者可以删改它** —— 它的价值是防遗忘、便于转述，'
                 + '不是抗篡改审计存储。',
     alert_from_log: '（重启前的记录）',
+    alert_resolved: '已恢复',
 
     sig_checking: '校验中', sig_ok: '签名有效', sig_forged: '签名伪造',
     sig_untrusted: '根证书不受信任', sig_noimage: '无镜像文件',
@@ -374,6 +375,7 @@ const LANGS = {
                 + '记录文件就在数据目录里，跟你同样权限的程序能改它 —— '
                 + '它的用处是"帮你记住"，不是"防人删"。',
     alert_from_log: '（重启前记下的）',
+    alert_resolved: '已经好了',
 
     sig_checking: '正在验签名', sig_ok: '签名正常', sig_forged: '签名是假的',
     sig_untrusted: '签名来路不明', sig_noimage: '没有可执行文件',
@@ -717,7 +719,11 @@ function render() {
   $('#tabArtCount').textContent = s.artifact_findings;
   $('#tabArtCount').className = s.artifact_levels.critical > 0 ? 'crit'
     : (s.artifact_levels.high > 0 ? 'high' : '');
-  $('#tabAlertCount').textContent = STATE.alerts.length;
+  // ⚠️ 排除「已恢复」的历史条目：徽章是"发现的问题"，
+  //    一条已经从安全日志还原、且当前状态已正常的记录不是"当前的问题"。
+  //    否则它会与顶栏「目前没问题」自相矛盾（2026-10-08 实测踩到）。
+  $('#tabAlertCount').textContent =
+    STATE.alerts.filter((a) => !a.resolved).length;
   if (STATE.net) {
     const focusN = (STATE.net.flows || []).filter(netIsFocus).length;
     const netBad = (netLv.critical || 0) + (netLv.high || 0);
@@ -1317,16 +1323,18 @@ function renderAlerts() {
       <div class="alarm-rule">[${esc(r.id)}] ${esc(ruleTitle({ rule_id: r.id, title: r.title }))}
         <div class="ev">${esc(r.evidence)}</div>
         ${r.advice ? `<div class="alarm-adv">${esc(r.advice)}</div>` : ''}</div>`).join('');
-    return `<div class="alertitem ${a.level}${a.net ? ' netalert' : ''}${a.watch ? ' watchalert' : ''}"
+    return `<div class="alertitem ${a.level}${a.resolved ? ' resolved' : ''}${a.net ? ' netalert' : ''}${a.watch ? ' watchalert' : ''}"
         ${a.net_key ? `data-nkey="${esc(a.net_key)}"` : ''}>
       <div class="alarm-head">
         <time>${esc(a.time)}</time>
-        <span class="badge ${LEVEL_ORDER[a.level] != null ? a.level : 'clean'}">${esc(LEVEL_ZH[a.level] || LEVEL_ZH.clean)}</span>
+        <span class="badge ${a.resolved ? 'clean' : (LEVEL_ORDER[a.level] != null ? a.level : 'clean')}">${esc(a.resolved ? T('alert_resolved') : (LEVEL_ZH[a.level] || LEVEL_ZH.clean))}</span>
         <b>${esc(a.name)}</b>
         ${a.pid ? `<span class="mono" style="color:var(--dim)">PID ${a.pid}</span>` : ''}
         ${a.net ? '<span class="nettag">网络</span>' : ''}
         ${a.watch ? `<span class="nettag">文件监控</span>` : ''}
-        ${a.from_log ? `<span class="logtag">${esc(T('alert_from_log'))}</span>` : ''}
+        ${a.resolved
+          ? `<span class="logtag resolved">${esc(T('alert_resolved'))}</span>`
+          : (a.from_log ? `<span class="logtag">${esc(T('alert_from_log'))}</span>` : '')}
       </div>
       ${a.exe ? `<div class="artsub">${esc(a.exe)}</div>` : ''}
       <div class="alarm-rules">${rules}</div>

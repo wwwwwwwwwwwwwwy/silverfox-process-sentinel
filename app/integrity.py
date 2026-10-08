@@ -214,17 +214,55 @@ def baseline_path(workspace: str, app_dir: str | None = None) -> str:
     return os.path.join(workspace, f"integrity.baseline.{_install_tag(app_dir)}.json")
 
 
+def _baseline_keys_compatible(files: dict) -> bool:
+    """基线的**键名格式**是否与当前版本一致。
+
+    ⚠️ 为什么需要这个校验（2026-10-08 实测，代价很大）：
+
+    `load_baseline` 有一处"退到旧文件名"的兼容回退。但那个旧文件是**更早的
+    代码**写的，键名格式不同 —— app/ 之外的文件那时记**裸名字**
+    （`python_path.txt` / `whitelist.json` / `停止监视器.bat`），
+    现在是 `<root>/python_path.txt`（F-014 加的，避免与 app/ 下同名文件互相覆盖）。
+
+    拿新格式清单去比旧格式基线，结果是**每一个受保护文件都"既新增又缺失"**，
+    于是界面弹出一条 critical「程序文件已被改动」并写进安全日志；而程序文件
+    其实完好无损。更糟的是那条记录会被还原进时间线，与顶栏"目前没问题"
+    长期自相矛盾 —— **常态化误报会让用户学会无视告警，等于把自检废掉。**
+
+    判定（自包含，不依赖"文件是否存在"这类机器相关状态）：
+      当前版本对**裸名字**的使用只有一种 —— app/ 下**直接放着**的模块（.py）。
+      app/ 之外的一切（启动器 .bat / python_path.txt / whitelist.json）
+      一律带 `<root>/` 前缀。所以"裸名字且不是 .py"只可能来自旧格式。
+
+    宁可把旧基线当成"没有基线"（走哨兵判断 → baseline_lost / 首次运行），
+    也不要报一份假的"全部被改动"。
+    """
+    for k in files:
+        if k.startswith("<root>/") or "/" in k or "\\" in k:
+            continue
+        if not k.lower().endswith(".py"):
+            return False
+    return True
+
+
 def load_baseline(workspace: str, app_dir: str | None = None) -> dict | None:
-    """读本安装的基线；找不到再退到无后缀的旧文件名（一次性迁移）。"""
-    cands = [baseline_path(workspace, app_dir)]
+    """读本安装的基线；找不到再退到无后缀的旧文件名（一次性迁移）。
+
+    ⚠️ 回退候选必须先过**键名格式**校验（见 _baseline_keys_compatible）——
+    否则新清单比旧基线会报出"每个文件都既新增又缺失"的假 critical。
+    """
+    cands = [(baseline_path(workspace, app_dir), True)]
     if app_dir is not None:
-        cands.append(baseline_path(workspace, None))   # 旧命名，兼容迁移
-    for p in cands:
+        cands.append((baseline_path(workspace, None), False))  # 旧命名，兼容迁移
+    for p, is_primary in cands:
         try:
             with open(p, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            if isinstance(d, dict) and isinstance(d.get("files"), dict):
-                return d
+            if not (isinstance(d, dict) and isinstance(d.get("files"), dict)):
+                continue
+            if not is_primary and not _baseline_keys_compatible(d["files"]):
+                continue   # 旧格式：不采用（否则会报出"全部被改动"的假告警）
+            return d
         except Exception:
             continue
     return None

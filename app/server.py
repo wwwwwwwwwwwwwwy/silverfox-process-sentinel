@@ -238,6 +238,10 @@ class Monitor:
                 "pid": 0,
                 "exe": r.get("detail") or "",
                 "from_log": True,          # 界面据此标注「来自日志（重启前）」
+                # 来源类别：界面/服务端据此判断"这条历史事件描述的问题是否已不存在"。
+                # 目前只对 integrity 做判断（当前状态可以直接重算），
+                # watch 由 check_watch 独立重检，不需要在这里推断。
+                "log_kind": r.get("kind"),
                 "rules": [{"id": "LOG", "title": r.get("title") or "",
                            "severity": r.get("level") or "medium",
                            "evidence": r.get("detail") or ""}],
@@ -248,6 +252,35 @@ class Monitor:
             self.alerts.extend(restored[:80])
             self.alerts.sort(key=lambda x: x.get("ts") or 0, reverse=True)
             self.alerts_from_log = len(restored[:80])
+
+    def _alerts_for_ui(self) -> list[dict]:
+        """给界面的告警列表 —— 顺便标注历史条目是否**已恢复**。
+
+        ⚠️ 为什么必须标（2026-10-08 实测）：
+
+        `_restore_alerts_from_log()` 把历史安全事件还原进时间线，**保留原始
+        level**（可能是 critical）。若那条事件描述的问题**现在已经不存在**
+        ——例如程序文件是被用户自己更新过、并已重建基线——界面却仍把它画成
+        一条 critical，就会与顶栏「目前没问题」、KPI「0 严重」、
+        安全状态「✓ 文件完整性正常」**同屏自相矛盾**。
+
+        实测后果：一条 11:08 的迁移期误报在界面上挂了整整一天，
+        用户据此判断"程序完整性异常"，而实际代码完好。
+
+        判定规则：历史条目 + 来源是 integrity + **当前**完整性状态为 ok
+        → 标 `resolved`。当前状态由 check_integrity 独立重算，
+        所以这个标注不会掩盖任何**仍然存在**的问题。
+        """
+        integ_ok = (self.integrity or {}).get("status") == "ok"
+        out = []
+        for a in self.alerts:
+            if a.get("from_log") and a.get("log_kind") == "integrity" and integ_ok:
+                b = dict(a)
+                b["resolved"] = True
+                out.append(b)
+            else:
+                out.append(a)
+        return out
 
     def _loop(self):
         # 首轮顺序（2026-10-07 调整）：完整性 → **进程** → 系统痕迹（后台）
@@ -1021,7 +1054,9 @@ class Monitor:
                 "net": net,
 "processes": self.procs,
                 "artifacts": af,
-                "alerts": self.alerts[:100],
+                # 走 _alerts_for_ui：历史条目若"已恢复"会被标出来，
+                # 界面据此降级显示且不计入「发现的问题」。
+                "alerts": self._alerts_for_ui()[:100],
             }
 
     def process_detail(self, pid: int) -> dict:
