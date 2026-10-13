@@ -27,6 +27,7 @@ _common.ensure_import_path()
 
 import iocs    # noqa: E402
 import rules   # noqa: E402
+import whitelist  # noqa: E402
 
 CTX = {"by_pid": {}, "sig_cache": {}, "artifacts": {}, "self_pid": 0}
 PASS, FAIL = [], []
@@ -1897,6 +1898,102 @@ _p14 = next((f for f in _fs_tk2 if f["rule_id"] == "P014"), None)
 check("F-023 按映像名查杀安全软件仍判 critical(92)",
       _p14 is not None and _p14["severity"] == "critical" and _p14["weight"] == 92,
       f"{_p14['severity']}/{_p14['weight']}" if _p14 else "漏报")
+
+
+# ======================================================================
+# F-024 —— 2026-10-13 红蓝对抗测试的 4 条修复（白名单 / 完整性 / 接口语义）
+# ======================================================================
+# 这一组的特点：**前三条全都在同一条业务链上**（已知项机制），
+# 且第一条是"能静默关掉检测"的通道 —— 单测正则完全覆盖不到，
+# 必须直接测函数行为。
+print()
+print("=" * 72)
+print("F-024 已知项机制与完整性豁免（2026-10-13 对抗测试修复）")
+print("=" * 72)
+
+import tempfile as _tempfile  # noqa: E402
+import uuid as _uuid          # noqa: E402
+
+
+# ---- F-024.1 已知项 ID 必须唯一（否则删一条会连带删掉同秒的全部）----
+# 原实现 `"wl-" + time.strftime("%Y%m%d-%H%M%S")` 只精确到秒。
+_orig_wl_file = whitelist.WHITELIST_FILE
+_tmpd = _tempfile.mkdtemp(prefix="yh-selfcheck-")
+try:
+    whitelist.WHITELIST_FILE = os.path.join(_tmpd, "whitelist.json")
+
+    _ids = [whitelist.add("P001", "cmdline_contains",
+                          f"selfcheck-value-{i}-aaaaaaaa", "", f"n{i}")["id"]
+            for i in range(5)]
+    check("F-024.1 同一秒内新增 5 条得到 5 个唯一 ID",
+          len(set(_ids)) == 5, f"唯一 {len(set(_ids))}/5")
+
+    _n0 = len(whitelist.load().get("entries") or [])
+    whitelist.remove(_ids[0])
+    _n1 = len(whitelist.load().get("entries") or [])
+    check("F-024.2 删除一条只少一条（不连带删除）",
+          _n1 == _n0 - 1, f"{_n0} -> {_n1}")
+
+    # 历史数据迁移：磁盘上已存在同 id 的多条时，删一条也只删一条
+    _d = whitelist.load()
+    _d["entries"] = [
+        {"id": "dup-1", "rule_id": "P001",
+         "match": {"type": "cmdline_contains", "value": "aaaa1111"}, "guard": {}, "note": "a"},
+        {"id": "dup-1", "rule_id": "P001",
+         "match": {"type": "cmdline_contains", "value": "bbbb2222"}, "guard": {}, "note": "b"},
+        {"id": "dup-1", "rule_id": "P001",
+         "match": {"type": "cmdline_contains", "value": "cccc3333"}, "guard": {}, "note": "c"},
+    ]
+    whitelist.save(_d)
+    whitelist.remove("dup-1")
+    _after = whitelist.load().get("entries") or []
+    check("F-024.3 历史重复 ID：删一条只删一条并自动迁移为唯一",
+          len(_after) == 2 and len({e.get("id") for e in _after}) == 2,
+          f"剩余 {len(_after)} 条，唯一 ID {len({e.get('id') for e in _after})} 个")
+finally:
+    whitelist.WHITELIST_FILE = _orig_wl_file
+    import shutil as _shutil
+    _shutil.rmtree(_tmpd, ignore_errors=True)
+
+
+# ---- F-024.4 完整性豁免必须精确匹配 <root>/whitelist.json ----
+# 太窄 → 每次合法操作都报「程序文件已被改动」（常态化误报）；
+# 太宽（按 basename）→ app/ 下投放的同名文件会被一并豁免（篡改洗白）。
+import server as _server  # noqa: E402
+
+# ⚠️ 必须用 getattr 兜底：未修复版本里这个函数**根本不存在**，
+#    直接 _server._is_whitelist_key(...) 会抛 AttributeError 把整个自检打断，
+#    后面的用例全部跑不到 —— 那等于"测试自己把测试搞崩了"。
+_isk = getattr(_server, "_is_whitelist_key", None)
+check("F-024.4 豁免判据认得真实键 <root>/whitelist.json",
+      callable(_isk) and _isk("<root>/whitelist.json") is True,
+      "函数不存在或判错 → 每次加已知项都会误报完整性异常")
+check("F-024.5 豁免判据不认 app/ 内的裸名 whitelist.json",
+      callable(_isk) and _isk("whitelist.json") is False,
+      "否则 app/ 下投放的同名文件可被洗进基线")
+check("F-024.6 豁免判据不认其它目录的同名文件",
+      callable(_isk) and _isk("<root>/sub/whitelist.json") is False,
+      "只允许恰好这一个键")
+
+
+# ---- F-024.7 零命中预授权必须被拒（防"提前关掉一条规则"）----
+# 这是本轮最重的一条：hits==0 原先静默放行，攻击者可趁载荷未上线时写豁免。
+# 单测不易构造完整 Handler，改为**源码断言**：拒绝分支必须存在。
+_src_server = io.open(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app", "server.py"),
+    encoding="utf-8").read()
+check("F-024.7 服务端存在「零命中一律拒绝」分支",
+      "if not hits:" in _src_server and "当前没有命中任何对象" in _src_server,
+      "否则可预授权豁免、静默关掉将来的告警")
+check("F-024.8 服务端存在「命中对象须与指定对象一致」校验",
+      "scope_hit" in _src_server and "与你指定的对象不一致" in _src_server,
+      "否则会「指定 A、忽略 B」")
+
+
+# ---- F-024.9 时长消息必须用实际生效值（F-003 的有限越界同类回归）----
+check("F-024.9 时长消息改用实际生效值（而非未钳制的原值）",
+      'eff = r.get("duration", dur)' in _src_server and "已按边界值执行" in _src_server,
+      "否则会出现「说 0.0 秒、实际 5 秒」")
 
 
 print()

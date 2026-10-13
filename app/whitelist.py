@@ -33,6 +33,7 @@ import os
 import re
 import threading
 import time
+import uuid
 
 import paths
 
@@ -283,9 +284,24 @@ def add(rule_id: str, match_type: str, match_value: str,
         return _add_locked(d, rule_id, match_type, match_value, guard_file, note)
 
 
+def _new_entry_id() -> str:
+    """生成**唯一**的条目 ID。
+
+    ⚠️ 加固（2026-10-13，对抗测试 F-102）：原实现是
+    `"wl-" + time.strftime("%Y%m%d-%H%M%S")`，只精确到**秒**。
+    同一秒内新增的多条已知项会拿到**同一个 id**，而 remove() 按 id 过滤 ——
+    于是"删掉一条误报"会连带删掉同一秒内加入的**全部**条目。
+
+    实测（2/2）：连发 5 条 → 5 条共用 1 个 id；remove 一次 → 5 条全没。
+
+    修复：保留人类可读的时间前缀，再拼一段随机后缀，保证唯一。
+    """
+    return "wl-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+
+
 def _add_locked(d: dict, rule_id: str, match_type: str, match_value: str,
                 guard_file: str, note: str) -> dict:
-    eid = "wl-" + time.strftime("%Y%m%d-%H%M%S")
+    eid = _new_entry_id()
     entry = {
         "id": eid,
         "rule_id": rule_id,
@@ -300,14 +316,32 @@ def _add_locked(d: dict, rule_id: str, match_type: str, match_value: str,
 
 
 def remove(entry_id: str) -> bool:
+    """删除一条已知项。
+
+    ⚠️ 加固（2026-10-13，对抗测试 F-102）：ID 现在唯一了，但**磁盘上可能已经存在**
+    旧版本写下的重复 id 条目（同秒多条）。如果这里仍按 id 全量过滤，
+    用户"删一条"依旧会连带删掉其它条目。
+
+    所以这里改成：**只删第一个匹配项**，并且当发现该 id 不止一条时，
+    把剩余重复条目重新分配新 id（迁移），使数据恢复自洽。
+    """
     with _LOCK:
         d = load()
         if d.get("_corrupt"):
             raise ValueError("已知项文件损坏，已停止写入以免覆盖原内容：" + d["_corrupt"])
-        before = len(d.get("entries") or [])
-        d["entries"] = [e for e in (d.get("entries") or []) if e.get("id") != entry_id]
-        if len(d["entries"]) == before:
+        entries = d.get("entries") or []
+        idx = next((i for i, e in enumerate(entries) if e.get("id") == entry_id), None)
+        if idx is None:
             return False
+        entries.pop(idx)
+        # 迁移：把仍然重复的历史 id 重新分配，避免后续 remove 再次误伤
+        seen: set[str] = set()
+        for e in entries:
+            eid = e.get("id") or ""
+            if not eid or eid in seen:
+                e["id"] = _new_entry_id()
+            seen.add(e["id"])
+        d["entries"] = entries
         save(d)
         return True
 

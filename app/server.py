@@ -432,7 +432,7 @@ class Monitor:
                 return ["（缺失）" + r for r in removed]
             changed = sorted(k for k in cur if k in old and cur[k] != old[k])
             added = sorted(k for k in cur if k not in old)
-            unexpected = [k for k in changed + added if k != "whitelist.json"]
+            unexpected = [k for k in changed + added if not _is_whitelist_key(k)]
             if unexpected:
                 return unexpected
 
@@ -1098,6 +1098,38 @@ class Monitor:
 # HTTP 服务
 # ================================================================
 
+def _is_whitelist_key(k: str) -> bool:
+    """这个基线键是否代表**真正的那个** whitelist.json（运行期数据目录里的已知项文件）？
+
+    ⚠️ 加固（2026-10-13，对抗测试 F-104）：原先判据写的是裸名
+    `k != "whitelist.json"`，而 integrity.collect_manifest() 给 app/ 之外的文件
+    生成键时统一加 `<root>/` 前缀（integrity.py 里
+    `manifest["<root>/" + basename] = ...`）——
+    于是真实键是 `<root>/whitelist.json`，与裸名**永不相等**。
+
+    后果（干净复现，2/2）：用户每次合法地"加入已知项"，whitelist.json 的哈希都会变，
+    却永远被判为 unexpected → 返回 integrity_refresh="blocked" →
+    用户看到"检测到其它程序文件与基线不一致"；重启后完整性状态直接变
+    `changed`「⚠️ 程序文件已被改动」，并插入一条 critical 告警，
+    **而唯一被改的文件正是设计上要豁免的那一个**。
+
+    这恰是 README 反复强调必须避免的"常态化误报"——
+    误报一旦常态化，用户就会学会无视它，整个完整性自检等于废掉。
+
+    ⚠️ 判据必须**精确**，不能用宽泛的 basename 匹配（对抗测试 F-105）：
+    那样会把 **app/ 下任何**叫 whitelist.json 的文件也一并豁免。实测：
+    攻击者在 app/ 里投放 whitelist.json（键为裸名），用户随后加一条
+    正常已知项，这个投放文件就被一起写进新基线 —— 篡改被洗白。
+
+    所以只认 `<root>/whitelist.json` 这一个键。理由：已知项文件始终由
+    paths.WHITELIST_FILE 指向、经 default_extras() 以 `<root>/` 前缀进入清单；
+    而 app/ 内部的同名文件**不在**豁免之列 —— app/ 是程序代码，
+    任何新增文件都应当被告警。
+    """
+    n = str(k).replace("\\", "/").strip()
+    return n.lower() == "<root>/whitelist.json"
+
+
 class Handler(BaseHTTPRequestHandler):
     monitor: Monitor = None
     server_version = "YinhuSentinel/1.0"
@@ -1470,19 +1502,56 @@ class Handler(BaseHTTPRequestHandler):
                     "guard": {"file": guard_file,
                               "sha256": whitelist._sha256(guard_file) if guard_file else ""}}
             hits = []
+            scope_hit = False
             for x in m.procs:
                 for f in x.get("findings", []):
                     if whitelist.entry_matches(cand, f, x):
                         hits.append(f"{x.get('name')}(pid {x.get('pid')})")
+                        if scope_pid is not None:
+                            try:
+                                if int(scope_pid) == int(x.get("pid") or -1):
+                                    scope_hit = True
+                            except (TypeError, ValueError):
+                                pass
             for a in m.artifact_findings:
                 for f in a.get("findings", []):
                     if whitelist.entry_matches(cand, f, a):
                         hits.append(f"{a.get('title')}({a.get('id')})")
+                        if scope_aid and scope_aid == str(a.get("id") or ""):
+                            scope_hit = True
+            # ⚠️ 加固（2026-10-13，对抗测试 F-103）：原实现只拒绝 `len(hits) > 1`，
+            #    于是 **hits == 0 会静默放行**。而"当前零命中"恰恰是最危险的一类：
+            #    它此刻不改变任何结论（界面毫无变化），却为**将来**出现的匹配对象
+            #    预先开好了豁免。攻击者（或一次误操作）可以趁目标进程还没起来时
+            #    写入 `P001 + cmdline_contains "<载荷特征串>"`，等载荷上线时
+            #    P001（critical 95）直接静默消失。
+            #
+            #    实测杀伤链（2/2）：用无害替身把 cmd.exe 复制成 svchost.exe 放进
+            #    用户可写目录 → 阶段1 P001 命中（critical 100）；
+            #    停掉替身使 hits 归零 → 写入一条预授权已知项（服务端 200 接受）；
+            #    重启同一个替身 → P001 消失、whitelisted=1，等级从 critical 掉到
+            #    仅剩 P002/P006。**同一个伪装进程，检测被静默关掉了一条。**
+            #
+            #    修法（两道）：
+            #      ① 零命中一律拒绝 —— 没有"当前就命中"的对象，就没有要忽略的告警；
+            #      ② 那唯一一个命中必须**就是**用户指定的那个对象，
+            #         否则说明用户指的 A、实际忽略的是 B（请求语义与效果不符）。
+            if not hits:
+                self._json({"ok": False,
+                            "msg": "这条已知项当前没有命中任何对象，已拒绝："
+                                   "忽略一个此刻并不存在的告警没有意义，"
+                                   "而它会在将来命中时静默放行 —— 请等该告警出现后再处理"}, 400)
+                return
             if len(hits) > 1:
                 shown = "、".join(hits[:5]) + ("…" if len(hits) > 5 else "")
                 self._json({"ok": False,
                             "msg": f"这条已知项会同时命中 {len(hits)} 个对象（{shown}）——"
                                    f"请把匹配条件收窄到只针对你要忽略的那一个"}, 400)
+                return
+            if not scope_hit:
+                self._json({"ok": False,
+                            "msg": f"这条已知项命中的对象（{hits[0]}）与你指定的对象不一致 ——"
+                                   f"请确认要忽略的是哪一个，避免误伤其它告警"}, 400)
                 return
 
             # ④ 匹配值还要"够具体"：非空不等于够窄 ——
@@ -1539,8 +1608,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 dur = float(netmon.DEFAULT_DURATION)
             if p == "/api/net/start":
-                m.netmon.start_session(dur)
-                self._json({"ok": True, "msg": f"已开始一轮 {netmon.fmt_duration(dur)} 的网络观测"})
+                # ⚠️ 加固（2026-10-13，对抗测试 F-106）：消息必须用**实际生效值**。
+                #    start_session 内部同样会钳制到 [5, 7200]，用原始 dur 拼消息
+                #    会出现"说 5.3 分、实际 5.0 分"这类说得和做的不一致。
+                real = m.netmon.start_session(dur)
+                eff = (real or {}).get("duration", dur) if isinstance(real, dict) else dur
+                self._json({"ok": True,
+                            "msg": f"已开始一轮 {netmon.fmt_duration(eff)} 的网络观测"})
             elif p == "/api/net/duration":
                 r = m.netmon.set_duration(dur)
                 # F-003：非法入参（非数字 / NaN / 无穷）明确回 400 ——
@@ -1549,12 +1623,26 @@ class Handler(BaseHTTPRequestHandler):
                 if r.get("bad"):
                     self._json({"ok": False, "msg": r.get("msg") or "观测时长不合法"}, 400)
                     return
+                # ⚠️ 加固（2026-10-13，对抗测试 F-106）：F-003 只覆盖了 NaN / inf，
+                #    **有限但越界**的值（-1、1、4.9、1e308）仍会走进同一坑：
+                #    消息用未钳制的原值，r["duration"] 是钳制后的实际值。
+                #    实测 `duration=-1` → 消息「已改为 0.0 秒」而实际 5.0；
+                #    `duration=1e308` → 消息里印出 300 多位的天文数字，实际 7200。
+                #    修法：统一以 r["duration"]（真实生效值）拼消息。
+                eff = r.get("duration", dur)
                 if r.get("finalized"):
-                    msg = f"观测时长已改为 {netmon.fmt_duration(dur)}，已到时间，本轮结算完成"
+                    msg = f"观测时长已改为 {netmon.fmt_duration(eff)}，已到时间，本轮结算完成"
                 elif r.get("restarted"):
-                    msg = f"已按 {netmon.fmt_duration(dur)} 重新开始一轮观测"
+                    msg = f"已按 {netmon.fmt_duration(eff)} 重新开始一轮观测"
                 else:
-                    msg = f"观测时长已改为 {netmon.fmt_duration(dur)}"
+                    msg = f"观测时长已改为 {netmon.fmt_duration(eff)}"
+                # 原值与实际值不同时，明确说明被钳制到了哪里 —— 不让用户猜
+                try:
+                    if abs(float(dur) - float(eff)) > 1e-9:
+                        msg += (f"（你给的 {netmon.fmt_duration(dur)} 超出允许范围 "
+                                f"5 秒 ~ 2 小时，已按边界值执行）")
+                except (TypeError, ValueError):
+                    pass
                 self._json({"ok": True, "msg": msg, **r})
             else:
                 self._json(m.netmon.stop_session())

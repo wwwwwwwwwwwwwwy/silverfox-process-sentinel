@@ -108,7 +108,12 @@ print(f"  建议：{json.dumps(sug, ensure_ascii=False)[:180]}")
 
 code, add = _common.http(port, "/api/whitelist/add", "POST",
                          {"rule_id": rid, "match": sug.get("match"),
-                          "guard": sug.get("guard"), "note": "e2e 测试"},
+                          "guard": sug.get("guard"), "note": "e2e 测试",
+                          # ⚠️ 2026-10-13：必须指明这条已知项针对哪个对象。
+                          #    上一轮对抗测试给 /api/whitelist/add 加了对象断言
+                          #    （防"一条 entry 关掉整条规则"），本脚本当时没跟上，
+                          #    一直报「必须指明这条已知项针对哪个对象」。
+                          "pid": target["pid"]},
                          token)
 C.check("加入已知项成功", bool((add or {}).get("ok")), str((add or {}).get("msg", "")))
 eid = ((add or {}).get("entry") or {}).get("id", "")

@@ -172,14 +172,45 @@ def http(port: int, path: str, method: str = "GET", body: dict | None = None,
 
 
 def session_token(port: int) -> str:
-    """从首页 HTML 里取本次会话令牌（仅用于本地测试）。"""
+    """取本次会话令牌（仅用于本地测试）。
+
+    ⚠️ 2026-10-13 修复：**令牌已不再注入首页 HTML**。
+    上一轮对抗测试（F-001）把首页里的 `<meta name="yinhu-token">` 去掉了 ——
+    理由是正确的：任何能读到首页的本地进程都能直接 grep 到令牌，
+    于是改成由响应头 `Set-Cookie: yinhu-token=...; SameSite=Strict` 下发。
+
+    但本函数仍在按老办法从 HTML 里正则取令牌，结果**永远取到空串** ——
+    e2e 测试全线报「访问令牌缺失或不正确」，看起来像功能坏了，
+    实际是测试没跟上。实测：本仓库修复前后该脚本的失败项数完全相同（5 项），
+    说明它一直在测"取不到令牌"，而不是被测功能。
+
+    正确取法（两条，按可靠性排序）：
+      1. `Set-Cookie` 响应头 —— 与真实浏览器同一条路径；
+      2. 数据目录下的 `runtime_token.txt` —— 监视器启动时自己写的，
+         本机测试可用；真实攻击者读它属于已知的用户态上限（见 README 第九节）。
+    """
+    # ① 优先：Set-Cookie（与浏览器一致）
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=6) as r:
-            html = r.read().decode("utf-8", "replace")
-        m = re.search(r'name="yinhu-token" content="([^"]+)"', html)
-        return m.group(1) if m else ""
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/")
+        with urllib.request.urlopen(req, timeout=6) as r:
+            for raw in (r.headers.get_all("Set-Cookie") or []):
+                m = re.search(r"yinhu-token=([^;,\s]+)", raw)
+                if m:
+                    return m.group(1)
     except Exception:
-        return ""
+        pass
+
+    # ② 回退：运行时令牌文件（监视器启动时自己写的）
+    try:
+        import paths
+        with open(paths.TOKEN_FILE, "r", encoding="ascii") as f:
+            t = f.read().strip()
+        if t:
+            return t
+    except Exception:
+        pass
+
+    return ""
 
 
 # ---------------------------------------------------------------- 启停
